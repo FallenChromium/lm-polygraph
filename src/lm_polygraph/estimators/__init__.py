@@ -88,5 +88,14 @@ from .luq import LUQ
 from .eigenscore import EigenScore
 from .cocoa import CocoaMSP, CocoaPPL, CocoaMTE
 from .rauq import RAUQ
+from .tfb import (
+    TFBPredictiveEntropy,
+    TFBMeanLogProb,
+    TFBSampleVariance,
+    TFBSampleStd,
+    TFBLexicalSimilarity,
+    TFBNumberUniqueSamples,
+    TFBTokenLevelEntropy,
+)
 from .csl import CSL
 from .semantic_density import SemanticDensity

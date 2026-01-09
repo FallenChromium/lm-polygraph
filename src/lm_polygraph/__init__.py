@@ -3,3 +3,11 @@ from .utils.manager import UEManager
 from .utils.estimate_uncertainty import estimate_uncertainty
 from .utils.causal_lm_with_uncertainty import CausalLMWithUncertainty
 from .utils.dataset import Dataset
+from .utils.tfb import (
+    apply_tfb,
+    enable_tfb_sampling,
+    disable_tfb_sampling,
+    update_tfb_beta,
+    fit_tfb_beta,
+    compute_flip_ratio,
+)
