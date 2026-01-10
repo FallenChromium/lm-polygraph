@@ -52,20 +52,30 @@ def run_reference_bayesian_peft(model_path, adapter_path, beta=0.01, n_samples=1
         print(result.stderr)
         return None
     
-    output = result.stderr + result.stdout # Logging often goes to stderr
+    # Instead of stdout, we MUST read the log file because we reverted the print changes in the lib.
+    log_file_path = os.path.join(cwd_path, "checkpoints", "tfblora_acc", model_path, "pqa_labeled", "default", "log.txt")
+    
+    if not os.path.exists(log_file_path):
+        print(f"Log file not found at {log_file_path}")
+        print("Subprocess Output:", result.stdout[-500:])
+        return None
+        
+    with open(log_file_path, 'r') as f:
+        output = f.read()
+    
     # Parse NLL, ACC from logs
     # Log format: val_acc: 0.5, val_ece: 0.1, val_nll: 2.3, val_brier: 0.2
     
-    nll_match = re.search(r"val_nll:\s*([0-9.]+)", output)
-    acc_match = re.search(r"val_acc:\s*([0-9.]+)", output)
+    nll_match = re.findall(r"val_nll:\s*([0-9.]+)", output)
+    acc_match = re.findall(r"val_acc:\s*([0-9.]+)", output)
     
     if not nll_match:
-        print("Could not parse NLL from output.")
-        print("Output Snippet:", output[-500:])
+        print("Could not parse NLL from log file.")
         return None
         
-    nll = float(nll_match.group(1))
-    acc = float(acc_match.group(1)) if acc_match else 0.0
+    # Take the last evaluation result
+    nll = float(nll_match[-1])
+    acc = float(acc_match[-1]) if acc_match else 0.0
     
     return {"nll": nll, "acc": acc}
 
