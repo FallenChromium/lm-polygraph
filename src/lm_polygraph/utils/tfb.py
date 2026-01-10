@@ -433,16 +433,13 @@ def fit_tfb_beta(
     disable_tfb_sampling(model)
     
     baseline_metrics = []
-    baseline_preds = []
     
     with torch.no_grad():
         for inputs in calibration_inputs:
             metric_val, det_probs = metric_fn(model, inputs, n_samples, parallel)
             baseline_metrics.append(metric_val)
-            baseline_preds.append(det_probs.argmax(dim=-1))
     
     baseline_metric = torch.stack(baseline_metrics).mean().item()
-    baseline_preds = torch.cat(baseline_preds)
     
     if verbose:
         print(f"Baseline metric: {baseline_metric:.6f}")

@@ -168,7 +168,7 @@ Answer:"""
         with torch.no_grad():
             det_logits = m(**inputs).logits[:, -1, target_ids_tensor]
             det_pred = det_logits.argmax(dim=-1)
-        
+
         # Stochastic sample
         enable_tfb_sampling(m)
         with torch.no_grad():
@@ -179,7 +179,7 @@ Answer:"""
         # Return mismatch count as "loss". 
         # Baseline at beta=0 will be 0.
         # Metric change will be the drift from deterministic.
-        return (stoch_pred != det_pred).float().mean(), det_pred
+        return (stoch_pred != det_pred).float().mean(), det_logits
 
     print("Running Calibration via fit_tfb_beta...")
     best_beta = fit_tfb_beta(
