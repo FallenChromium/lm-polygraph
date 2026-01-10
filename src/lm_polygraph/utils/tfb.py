@@ -425,8 +425,8 @@ def fit_tfb_beta(
     if metric_fn is None:
         metric_fn = _default_nll_metric
     
-    low, high = 0.001, initial_beta
-    best_beta = high
+    low, high = 0.0, initial_beta
+    best_beta = low
     
     # Compute baseline metric with zero noise
     update_tfb_beta(model, 0.0)
@@ -446,8 +446,6 @@ def fit_tfb_beta(
     
     # Binary search
     # We want to find max beta where the metric does not deviate significantly from baseline.
-    # - For 'Flip Rate' metric: baseline is 0. deviation is current_metric.
-    # - For NLL/Accuracy: baseline is >0. deviation is percent change.
     for iteration in range(max_iters):
         mid = (low + high) / 2
         update_tfb_beta(model, mid)
@@ -462,8 +460,6 @@ def fit_tfb_beta(
         current_metric = torch.stack(current_metrics).mean().item()
         
         # Determine if we exceeded the threshold
-        # If baseline is 0 (e.g. flip ratio), prediction change is absolute logic
-        # If baseline > 0 (e.g. accuracy), predicting change is relative
         if baseline_metric == 0:
              metric_ratio = current_metric
         else:
@@ -474,12 +470,12 @@ def fit_tfb_beta(
                   f"ratio={metric_ratio:.6f}")
         
         # Adjust search range
-        # Reference logic: if ratio > target, we are too noisy -> reduce beta (high = mid)
-        # We track 'best_beta' as the boundary value
         if metric_ratio > target_metric_ratio:
-            best_beta = mid
+            # Metric degradation is too high; need lower beta
             high = mid
         else:
+            # Metric degradation is acceptable; try higher beta
+            best_beta = mid
             low = mid
     
     # Set final beta

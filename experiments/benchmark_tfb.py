@@ -153,7 +153,7 @@ Answer:"""
     from lm_polygraph.utils.tfb import update_tfb_beta, fit_tfb_beta, disable_tfb_sampling
     
     # 3. Calibration (Binary Search)
-    cal_dataset = ds_split["train"].select(range(min(50, len(ds_split["train"]))))
+    cal_dataset = ds_split["train"].select(range(min(200, len(ds_split["train"]))))
     cal_inputs = [
         tokenizer(
             preamble.format(context=" ".join(item["context"]["contexts"]), question=item["question"]),
@@ -186,7 +186,7 @@ Answer:"""
         model, 
         cal_inputs, 
         target_metric_ratio=0.01, 
-        max_iters=10, 
+        max_iters=15, 
         initial_beta=beta,
         metric_fn=classification_acc_metric,
         verbose=True
