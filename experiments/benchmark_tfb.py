@@ -155,24 +155,56 @@ Answer:"""
     
     # 3. Calibration (Binary Search)
     # Match reference: 50 samples * 5 runs = 250 trials (0.4% resolution)
-    cal_dataset = ds_split["train"].select(range(min(50, len(ds_split["train"]))))
-    cal_inputs = [
-        tokenizer(
-            preamble.format(context=" ".join(item["context"]["contexts"]), question=item["question"]),
-            return_tensors="pt", truncation=True, max_length=512
-        ).to(device)
-        for item in cal_dataset
-    ]
+    # Use Data Collator for batching (matches Reference logic)
+    from transformers import DataCollatorWithPadding
+    collator = DataCollatorWithPadding(tokenizer=tokenizer, padding="longest")
     
-    def classification_acc_metric(m, inputs, n_s, p=False):
-        # Deterministic baseline
-        disable_tfb_sampling(m)
-        with torch.no_grad():
-            det_logits = m(**inputs).logits[:, -1, target_ids_tensor]
+    cal_dataset_subset = ds_split["train"].select(range(min(50, len(ds_split["train"]))))
+    
+    # Prepare samples first
+    cal_samples = []
+    for item in cal_dataset_subset:
+        prompt = preamble.format(context=" ".join(item["context"]["contexts"]), question=item["question"])
+        tokens = tokenizer(prompt, truncation=True, max_length=512)
+        cal_samples.append(tokens)
+    
+    # Batch them
+    batch_size = 8
+    cal_batches = []
+    # Pre-compute baselines for each batch
+    baselines = []
+    
+    # Disable sampling for baseline computation
+    disable_tfb_sampling(model)
+    update_tfb_beta(model, 0.0) # Ensure zero noise
+    
+    print("Pre-computing Calibration Baselines (beta=0)...")
+    with torch.no_grad():
+        for i in range(0, len(cal_samples), batch_size):
+            batch_items = cal_samples[i : i + batch_size]
+            batch = collator(batch_items)
+            batch = {k: v.to(device) for k, v in batch.items()}
+            
+            # Deterministic Baseline
+            det_logits = model(**batch).logits[:, -1, target_ids_tensor]
             det_probs = torch.softmax(det_logits, dim=-1)
-            det_pred = det_probs.argmax(dim=-1)
-
-        enable_tfb_sampling(m)
+            det_preds = det_probs.argmax(dim=-1)
+            
+            cal_batches.append(batch)
+            baselines.append(det_preds)
+            
+    # Zip them for fit_tfb_beta
+    # fit_tfb_beta will iterate this list.
+    # Each item is (inputs, baseline_preds)
+    cal_inputs_with_baseline = list(zip(cal_batches, baselines))
+    
+    def classification_acc_metric(m, args, n_s, p=False):
+        # args is (inputs, baseline_preds)
+        inputs, baseline_preds = args
+        
+        # Enable sampling is handled by fit_tfb_beta loop logic usually?
+        # fit_tfb_beta calls: enable_tfb_sampling(model) before metric_fn.
+        
         with torch.no_grad():
             all_probs = []
             for _ in range(n_s):
@@ -182,15 +214,13 @@ Answer:"""
             mean_probs = torch.stack(all_probs).mean(dim=0)
             stoch_pred = mean_probs.argmax(dim=-1)
             
-        # Return mismatch count as "loss". 
-        # Baseline at beta=0 will be 0.
-        # Metric change will be the drift from deterministic.
-        return (stoch_pred != det_pred).float().mean(), det_logits
+        # Return mismatch count from FIXED baseline
+        return (stoch_pred != baseline_preds).float().mean(), None
 
     print("Running Calibration via fit_tfb_beta...")
     best_beta = fit_tfb_beta(
         model, 
-        cal_inputs, 
+        cal_inputs_with_baseline, 
         target_metric_ratio=0.01, 
         max_iters=10, 
         n_samples=5, 

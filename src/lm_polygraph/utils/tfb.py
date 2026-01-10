@@ -427,27 +427,14 @@ def fit_tfb_beta(
     if metric_fn is None:
         metric_fn = _default_nll_metric
     
-    low, high = 0.0, initial_beta
-    best_beta = low
-    
-    # Compute baseline metric with zero noise
-    update_tfb_beta(model, 0.0)
-    disable_tfb_sampling(model)
-    
-    baseline_metrics = []
-    
-    with torch.no_grad():
-        for inputs in calibration_inputs:
-            metric_val, det_probs = metric_fn(model, inputs, n_samples, parallel)
-            baseline_metrics.append(metric_val)
-    
-    baseline_metric = torch.stack(baseline_metrics).mean().item()
+    # Reference logic: low=0.001, high=initial
+    low, high = 0.001, initial_beta
+    best_beta = high 
     
     if verbose:
-        print(f"Baseline metric: {baseline_metric:.6f}")
+        print(f"Starting TFB calibration: low={low}, high={high}, target={target_metric_ratio}")
     
     # Binary search
-    # We want to find max beta where the metric does not deviate significantly from baseline.
     for iteration in range(max_iters):
         mid = (low + high) / 2
         update_tfb_beta(model, mid)
@@ -456,28 +443,27 @@ def fit_tfb_beta(
         current_metrics = []
         with torch.no_grad():
             for inputs in calibration_inputs:
-                metric_val, _ = metric_fn(model, inputs, n_samples, parallel)
+                val = metric_fn(model, inputs, n_samples, parallel)
+                
+                if isinstance(val, tuple):
+                    metric_val = val[0]
+                else:
+                    metric_val = val
                 current_metrics.append(metric_val)
         
-        current_metric = torch.stack(current_metrics).mean().item()
+        # Average over batches
+        # current_metrics are likely 0-d tensors or floats
+        current_metric = torch.tensor(current_metrics).mean().item()
         
-        # Determine if we exceeded the threshold
-        if baseline_metric == 0:
-             metric_ratio = current_metric
-        else:
-             metric_ratio = abs(current_metric - baseline_metric) / (baseline_metric + 1e-12)
+        metric_ratio = current_metric
 
         if verbose:
-            print(f"Iter {iteration}: beta={mid:.6f}, metric={current_metric:.6f}, "
-                  f"ratio={metric_ratio:.6f}")
+            print(f"Iter {iteration}: beta={mid:.6f}, metric={current_metric:.6f}")
         
-        # Adjust search range
         if metric_ratio > target_metric_ratio:
-            # Metric degradation is too high; need lower beta
+            best_beta = mid       
             high = mid
         else:
-            # Metric degradation is acceptable; try higher beta
-            best_beta = mid
             low = mid
     
     # Set final beta
@@ -523,3 +509,83 @@ def compute_flip_ratio(
             flip_count += (stoch_pred != det_pred).sum().item()
     
     return flip_count / (n_samples * det_pred.numel())
+
+
+def tfb_predict_bma(
+    model: nn.Module,
+    inputs: dict,
+    n_samples: int = 10,
+    target_ids: Optional[torch.Tensor] = None,
+) -> dict:
+    """
+    Make predictions using Bayesian Model Averaging over TFB samples.
+    
+    Args:
+        model: Model with TFB applied via apply_tfb()
+        inputs: Tokenized inputs dict with 'input_ids' and 'attention_mask'
+        n_samples: Number of stochastic samples for BMA. Default: 10
+        target_ids: Optional tensor of target token IDs to restrict predictions.
+                   If provided, only these token logits are used.
+                   
+    Returns:
+        Dictionary containing:
+            - 'bma_probs': BMA-averaged probabilities [batch, vocab/num_targets]
+            - 'predictions': Argmax predictions from BMA probs [batch]
+            - 'sample_probs': Per-sample probabilities [n_samples, batch, vocab/num_targets]
+            - 'prob_std': Std of probabilities across samples [batch, vocab/num_targets]
+            - 'mean_std': Mean uncertainty (avg std across classes) [batch]
+            - 'deterministic_preds': Predictions without TFB noise [batch]
+            - 'flip_from_det': Whether BMA prediction differs from deterministic [batch]
+            
+    Example:
+        >>> inputs = tokenizer("What is 2+2?", return_tensors='pt').to(device)
+        >>> result = tfb_predict_bma(model, inputs, n_samples=10)
+        >>> print(f"Prediction: {result['predictions']}")
+        >>> print(f"Uncertainty: {result['mean_std']}")
+    """
+    device = next(model.parameters()).device
+    
+    disable_tfb_sampling(model)
+    with torch.no_grad():
+        det_output = model(**inputs)
+        det_logits = det_output.logits[:, -1, :]
+        if target_ids is not None:
+            det_logits = det_logits[:, target_ids]
+        det_probs = torch.softmax(det_logits, dim=-1)
+        det_preds = det_probs.argmax(dim=-1)
+    
+    enable_tfb_sampling(model)
+    all_probs = []
+    
+    with torch.no_grad():
+        for _ in range(n_samples):
+            output = model(**inputs)
+            logits = output.logits[:, -1, :]
+            if target_ids is not None:
+                logits = logits[:, target_ids]
+            probs = torch.softmax(logits, dim=-1)
+            all_probs.append(probs)
+    
+    sample_probs = torch.stack(all_probs, dim=0)
+    
+    bma_probs = sample_probs.mean(dim=0)
+    
+    # Predictions from BMA
+    predictions = bma_probs.argmax(dim=-1) 
+    
+    # Uncertainty: std of probabilities across samples
+    prob_std = sample_probs.std(dim=0) 
+    mean_std = prob_std.mean(dim=-1)
+    
+    # Flip detection
+    flip_from_det = (predictions != det_preds)
+    
+    return {
+        'bma_probs': bma_probs,
+        'predictions': predictions,
+        'sample_probs': sample_probs,
+        'prob_std': prob_std,
+        'mean_std': mean_std,
+        'deterministic_preds': det_preds,
+        'flip_from_det': flip_from_det,
+    }
