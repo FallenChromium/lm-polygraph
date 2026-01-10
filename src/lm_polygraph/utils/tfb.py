@@ -404,10 +404,9 @@ def fit_tfb_beta(
         target_metric_ratio: Target ratio of metric change. Default 0.01 (1%).
         max_iters: Maximum binary search iterations. Default 10.
         n_samples: Samples per forward pass during calibration. Default 5.
-        n_samples: Samples per forward pass during calibration. Default 5.
         initial_beta: Starting beta value (upper bound). Default 0.2.
         metric_fn: Optional custom metric function. Should take 
-                   (model, inputs, n_samples, parallel) and return (loss, baseline).
+                   (model, inputs, n_samples, parallel) and return (metric_val, baseline_info).
                    Default uses NLL-based metric.
         verbose: If True, print progress during search.
         parallel: If True, use batching for calibration forward passes (faster).

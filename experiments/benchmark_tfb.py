@@ -31,6 +31,10 @@ def run_reference_bayesian_peft(model_path, adapter_path, beta=0.01, n_samples=1
         # Minimal training args to satisfy parser
         "--lr", "1e-4", "--batch-size", "8", "--max-seq-len", "512",
         "--nowand", # Disable wandb
+        "--iter", "10",
+        "--testing-set", "train_train_val",
+        "--anchor-size", "50", # calibration set size
+        "--th", "0.01", # Target change ratio
     ]
     
     print("Executing:", " ".join(cmd))
@@ -103,7 +107,9 @@ def run_candidate_lm_polygraph(model_path, adapter_path, beta=0.01, n_samples=10
     # If my adapter fails in the subprocess, I will see it.
     
     # Assume we are using the 'train' split for now. 
-    dataset = load_dataset("qiaojin/PubMedQA", "pqa_labeled", split="train")
+    dataset_full = load_dataset("qiaojin/PubMedQA", "pqa_labeled", split="train")
+    ds_split = dataset_full.train_test_split(test_size=0.1, seed=42)
+    dataset = ds_split["test"] # Matches 'validation' split in dsets.py
     # For fair bench, define a subset.
     # bayesian-peft doesn't subsample unless requested. 
     # It runs on the full split provided. 
@@ -134,6 +140,50 @@ Answer:"""
 
     nll_vals = []
     
+    from lm_polygraph.utils.tfb import update_tfb_beta, fit_tfb_beta, disable_tfb_sampling
+    
+    # 3. Calibration (Binary Search)
+    cal_dataset = ds_split["train"].select(range(min(50, len(ds_split["train"]))))
+    cal_inputs = [
+        tokenizer(
+            preamble.format(context=" ".join(item["context"]["contexts"]), question=item["question"]),
+            return_tensors="pt", truncation=True, max_length=512
+        ).to(device)
+        for item in cal_dataset
+    ]
+    
+    def classification_acc_metric(m, inputs, n_s, p=False):
+        # Deterministic baseline
+        disable_tfb_sampling(m)
+        with torch.no_grad():
+            det_logits = m(**inputs).logits[:, -1, target_ids_tensor]
+            det_pred = det_logits.argmax(dim=-1)
+        
+        # Stochastic sample
+        enable_tfb_sampling(m)
+        with torch.no_grad():
+            # Match reference: 1 sample for calibration
+            stoch_logits = m(**inputs).logits[:, -1, target_ids_tensor]
+            stoch_pred = stoch_logits.argmax(dim=-1)
+            
+        # Return mismatch count as "loss". 
+        # Baseline at beta=0 will be 0.
+        # Metric change will be the drift from deterministic.
+        return (stoch_pred != det_pred).float().mean(), det_pred
+
+    print("Running Calibration via fit_tfb_beta...")
+    best_beta = fit_tfb_beta(
+        model, 
+        cal_inputs, 
+        target_metric_ratio=0.01, 
+        max_iters=10, 
+        initial_beta=beta,
+        metric_fn=classification_acc_metric,
+        verbose=True
+    )
+    
+    print(f"Optimal Beta found: {best_beta:.6f}")
+    update_tfb_beta(model, best_beta)
     enable_tfb_sampling(model)
     
     # Limit to first 50 samples for speed if not controllable in Ref?
@@ -143,16 +193,8 @@ Answer:"""
     with torch.no_grad():
         for i, item in enumerate(dataset):
             # Prep Input
-            context_str = "\n".join(item["context"]["contexts"]) if isinstance(item["context"]["contexts"], list) else item["context"]["contexts"]
-            # My adapter code used: e["context"]["contexts"]. Dictionary?
-            # PubMedQA structure: context: {contexts: [str], labels: [str], meshes: [str]}
-            # So `item["context"]["contexts"]` is a list of strings.
-            # Convert to string for prompt.
-            # My adapter code: `self.preamble.format(context=e["context"]["contexts"], ...)`
-            # Formatting a list into string directly? Python formatting `f"{list}"` prints brackets. 
-            # I must replicate that behavior exactly.
-            raw_context_list = item["context"]["contexts"]
-            prompt = preamble.format(context=raw_context_list, question=item["question"])
+            context_str = " ".join(item["context"]["contexts"]) # Match dsets.py formatting
+            prompt = preamble.format(context=context_str, question=item["question"])
             
             inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(device)
             
