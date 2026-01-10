@@ -441,13 +441,16 @@ def fit_tfb_beta(
             baseline_metrics.append(metric_val)
             baseline_preds.append(det_probs.argmax(dim=-1))
     
-    baseline_metric = torch.stack(baseline_metrics).mean()
+    baseline_metric = torch.stack(baseline_metrics).mean().item()
     baseline_preds = torch.cat(baseline_preds)
     
     if verbose:
-        print(f"Baseline metric: {baseline_metric.item():.6f}")
+        print(f"Baseline metric: {baseline_metric:.6f}")
     
     # Binary search
+    # We want to find max beta where the metric does not deviate significantly from baseline.
+    # - For 'Flip Rate' metric: baseline is 0. deviation is current_metric.
+    # - For NLL/Accuracy: baseline is >0. deviation is percent change.
     for iteration in range(max_iters):
         mid = (low + high) / 2
         update_tfb_beta(model, mid)
@@ -459,17 +462,23 @@ def fit_tfb_beta(
                 metric_val, _ = metric_fn(model, inputs, n_samples, parallel)
                 current_metrics.append(metric_val)
         
-        current_metric = torch.stack(current_metrics).mean()
+        current_metric = torch.stack(current_metrics).mean().item()
         
-        # Compute metric change ratio
-        metric_change = abs(current_metric - baseline_metric) / (baseline_metric + 1e-12)
-        metric_ratio = metric_change.item() / len(calibration_inputs)
-        
+        # Determine if we exceeded the threshold
+        # If baseline is 0 (e.g. flip ratio), prediction change is absolute logic
+        # If baseline > 0 (e.g. accuracy), predicting change is relative
+        if baseline_metric == 0:
+             metric_ratio = current_metric
+        else:
+             metric_ratio = abs(current_metric - baseline_metric) / (baseline_metric + 1e-12)
+
         if verbose:
-            print(f"Iter {iteration}: beta={mid:.6f}, metric={current_metric.item():.6f}, "
-                  f"change_ratio={metric_ratio:.6f}")
+            print(f"Iter {iteration}: beta={mid:.6f}, metric={current_metric:.6f}, "
+                  f"ratio={metric_ratio:.6f}")
         
         # Adjust search range
+        # Reference logic: if ratio > target, we are too noisy -> reduce beta (high = mid)
+        # We track 'best_beta' as the boundary value
         if metric_ratio > target_metric_ratio:
             best_beta = mid
             high = mid
