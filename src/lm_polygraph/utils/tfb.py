@@ -30,32 +30,16 @@ def _extract_lora_layers(model: nn.Module) -> List[Tuple[str, nn.Module]]:
     ]
 
 
-def _compute_variance_from_svd(
-    lora_B_weight: torch.Tensor,
+def _compute_rho_from_d(
+    D: torch.Tensor,
     in_features: int,
     beta: float,
     use_softplus: bool = False,
 ) -> torch.Tensor:
     """
-    Compute variance parameter (rho) from SVD of LoRA-B weight.
-    
-    The posterior std is inferred as: σ = β / (D + ε)
-    where D are the singular values of LoRA-B.
-    
-    Args:
-        lora_B_weight: LoRA-B weight matrix [out_features, r]
-        in_features: Input dimension of LoRA-A
-        beta: Variance scaling parameter
-        use_softplus: If True, use softplus parameterization; else use squared
-        
-    Returns:
-        rho parameter tensor [r, in_features]
+    Compute variance parameter (rho) from singular values D.
     """
-    # SVD decomposition: B = U @ diag(D) @ V^T
-    U, D, V = torch.linalg.svd(lora_B_weight, full_matrices=False)
-    
     # Infer std: σ = β / (D + ε), broadcast to [r, in_features]
-    # D has shape [r], we expand to [r, in_features]
     lora_std = beta / (D.reshape(-1, 1).expand(-1, in_features) + 1e-6)
     
     # Convert std to rho (inverse transform)
@@ -65,6 +49,23 @@ def _compute_variance_from_svd(
     else:
         # squared inverse: rho = sqrt(σ)
         rho = torch.sqrt(lora_std)
+    
+    return rho
+
+
+def _compute_variance_from_svd(
+    lora_B_weight: torch.Tensor,
+    in_features: int,
+    beta: float,
+    use_softplus: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute variance parameter (rho) and SVD decomposition of LoRA-B.
+    """
+    # SVD decomposition: B = U @ diag(D) @ V^T
+    U, D, V = torch.linalg.svd(lora_B_weight, full_matrices=False)
+    
+    rho = _compute_rho_from_d(D, in_features, beta, use_softplus)
     
     return rho, U, D, V
 
@@ -210,6 +211,8 @@ def apply_tfb(
         layer.tfb_use_softplus = use_softplus
         layer.tfb_beta = beta
         
+        layer.tfb_singular_values = nn.ParameterDict({})
+        
         for adapter_name in layer.lora_A.keys():
             lora_A = layer.lora_A[adapter_name]
             lora_B = layer.lora_B[adapter_name]
@@ -225,6 +228,9 @@ def apply_tfb(
             )
             
             layer.lora_A_rho[adapter_name] = nn.Parameter(rho.to(dtype_A))
+            
+            # Cache singular values for fast re-calibration
+            layer.tfb_singular_values[adapter_name] = nn.Parameter(D.to(dtype_B), requires_grad=False)
             
             # Transform: B' = U @ diag(D), A' = V^T @ A
             lora_B.weight = nn.Parameter((U @ torch.diag(D)).to(dtype_B))
@@ -286,11 +292,16 @@ def update_tfb_beta(
         module.tfb_beta = beta
         
         for adapter_name in module._active_adapter:
-            lora_B = module.lora_B[adapter_name].weight.float()
-            
-            rho, _, _, _ = _compute_variance_from_svd(
-                lora_B, module.in_features, beta, use_softplus
-            )
+            # Use cached singular values if available
+            if hasattr(module, 'tfb_singular_values') and adapter_name in module.tfb_singular_values:
+                D = module.tfb_singular_values[adapter_name].float()
+                rho = _compute_rho_from_d(D, module.in_features, beta, use_softplus)
+            else:
+                # Fallback to SVD (slower)
+                lora_B = module.lora_B[adapter_name].weight.float()
+                rho, _, _, _ = _compute_variance_from_svd(
+                    lora_B, module.in_features, beta, use_softplus
+                )
             
             dtype = module.lora_A_rho[adapter_name].dtype
             module.lora_A_rho[adapter_name] = nn.Parameter(rho.to(dtype))
@@ -305,20 +316,19 @@ def _default_nll_metric(
     model: nn.Module,
     inputs: dict,
     n_samples: int,
+    parallel: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Default NLL-based calibration metric.
     
-    Computes NLL of the most likely token under stochastic sampling.
-    Returns both the metric value and the deterministic predictions for flip ratio.
-    
     Args:
         model: Model with TFB applied
-        inputs: Tokenized inputs dict with input_ids, attention_mask
+        inputs: Tokenized inputs dict
         n_samples: Number of stochastic samples
+        parallel: If True, process samples in a single batch (VRAM heavy)
         
     Returns:
-        Tuple of (nll_loss, deterministic_logits)
+        Tuple of (nll_loss, deterministic_probs)
     """
     # Get deterministic prediction
     disable_tfb_sampling(model)
@@ -331,12 +341,35 @@ def _default_nll_metric(
     # Get stochastic predictions
     enable_tfb_sampling(model)
     all_probs = []
+    
     with torch.no_grad():
-        for _ in range(n_samples):
-            output = model(**inputs)
-            logits = output.logits[:, -1, :]
+        if parallel and n_samples > 1:
+            # Parallel: repeat inputs and run once
+            batch_inputs = {}
+            for k, v in inputs.items():
+                # [batch, seq] -> [batch * n, seq]
+                v_repeated = v.repeat_interleave(n_samples, dim=0)
+                batch_inputs[k] = v_repeated
+                
+            output = model(**batch_inputs)
+            logits = output.logits[:, -1, :]  # [batch * n, vocab]
             probs = torch.softmax(logits, dim=-1)
-            all_probs.append(probs)
+            
+            # Reshape stats: [batch * n, vocab] -> [n, batch, vocab]
+            # Since repeat_interleave groups samples: b1s1, b1s2... b2s1, b2s2
+            # We need to be careful with reshaping
+            batch_size = inputs['input_ids'].size(0)
+            probs = probs.view(batch_size, n_samples, -1).transpose(0, 1) # [n, batch, vocab]
+            
+            for i in range(n_samples):
+                all_probs.append(probs[i])
+        else:
+            # Sequential: run n times
+            for _ in range(n_samples):
+                output = model(**inputs)
+                logits = output.logits[:, -1, :]
+                probs = torch.softmax(logits, dim=-1)
+                all_probs.append(probs)
     
     # Average probabilities across samples
     mean_probs = torch.stack(all_probs).mean(dim=0)
@@ -356,6 +389,7 @@ def fit_tfb_beta(
     initial_beta: float = 0.2,
     metric_fn: Optional[CalibrationMetricFn] = None,
     verbose: bool = False,
+    parallel: bool = True,
 ) -> float:
     """
     Find optimal beta via binary search on calibration data.
@@ -370,11 +404,13 @@ def fit_tfb_beta(
         target_metric_ratio: Target ratio of metric change. Default 0.01 (1%).
         max_iters: Maximum binary search iterations. Default 10.
         n_samples: Samples per forward pass during calibration. Default 5.
+        n_samples: Samples per forward pass during calibration. Default 5.
         initial_beta: Starting beta value (upper bound). Default 0.2.
         metric_fn: Optional custom metric function. Should take 
-                   (model, inputs, n_samples) and return (loss, baseline).
+                   (model, inputs, n_samples, parallel) and return (loss, baseline).
                    Default uses NLL-based metric.
         verbose: If True, print progress during search.
+        parallel: If True, use batching for calibration forward passes (faster).
         
     Returns:
         Optimal beta value
@@ -402,7 +438,7 @@ def fit_tfb_beta(
     
     with torch.no_grad():
         for inputs in calibration_inputs:
-            metric_val, det_probs = metric_fn(model, inputs, n_samples)
+            metric_val, det_probs = metric_fn(model, inputs, n_samples, parallel)
             baseline_metrics.append(metric_val)
             baseline_preds.append(det_probs.argmax(dim=-1))
     
@@ -421,7 +457,7 @@ def fit_tfb_beta(
         current_metrics = []
         with torch.no_grad():
             for inputs in calibration_inputs:
-                metric_val, _ = metric_fn(model, inputs, n_samples)
+                metric_val, _ = metric_fn(model, inputs, n_samples, parallel)
                 current_metrics.append(metric_val)
         
         current_metric = torch.stack(current_metrics).mean()

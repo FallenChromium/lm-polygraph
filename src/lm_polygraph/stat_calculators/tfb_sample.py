@@ -64,6 +64,7 @@ class TFBSamplingCalculator(StatCalculator):
         beta: float = 0.2,
         use_softplus: bool = False,
         auto_apply_tfb: bool = True,
+        parallel: bool = False,
     ):
         """
         Initialize TFB sampling calculator.
@@ -85,6 +86,7 @@ class TFBSamplingCalculator(StatCalculator):
         self.use_softplus = use_softplus
         self.auto_apply_tfb = auto_apply_tfb
         self._tfb_applied = False
+        self.parallel = parallel
 
     def _ensure_tfb_applied(self, model: WhiteboxModel) -> None:
         """
@@ -167,21 +169,57 @@ class TFBSamplingCalculator(StatCalculator):
         
         # Generate samples
         with torch.no_grad():
-            for _ in range(self.n_samples):
+            if self.parallel and self.n_samples > 1:
+                # Parallel generation: batch repetition
+                batch_repeated = {}
+                for k, v in batch.items():
+                    # k is 'input_ids' or 'attention_mask' of shape [batch, len]
+                    # we need [batch*n, len]
+                    # repeat_interleave keeps (b1, b1, ..., b2, b2) grouping
+                    batch_repeated[k] = v.repeat_interleave(self.n_samples, dim=0)
+                
                 out = model.generate(
-                    **batch,
+                    **batch_repeated,
                     output_scores=True,
                     return_dict_in_generate=True,
                     max_new_tokens=max_new_tokens,
                     min_new_tokens=2,
-                    do_sample=False,  # Greedy - stochasticity comes from TFB
+                    do_sample=False,
                     num_beams=1,
                     num_return_sequences=1,
                 )
-                all_sequences.append(out.sequences)
-                # Stack scores: [seq_len, batch, vocab] -> [batch, seq_len, vocab]
-                stacked_scores = torch.stack(out.scores, dim=1)
-                all_logits.append(stacked_scores)
+                
+                # Unpack results: [batch*n, len] -> n x [batch, len]
+                # Since we used repeat_interleave, results are grouped by batch elem
+                # b1_s1, b1_s2, ..., b2_s1, b2_s2
+                
+                total_sequences = out.sequences
+                total_scores = torch.stack(out.scores, dim=1) # [batch*n, gen_len, vocab]
+                
+                for sample_idx in range(self.n_samples):
+
+                    indices = torch.arange(sample_idx, len(total_sequences), self.n_samples, device=model.device())
+
+                    all_sequences.append(total_sequences[indices])
+                    all_logits.append(total_scores[indices])
+
+            else:
+                # Sequential generation
+                for _ in range(self.n_samples):
+                    out = model.generate(
+                        **batch,
+                        output_scores=True,
+                        return_dict_in_generate=True,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=2,
+                        do_sample=False,  # Greedy - stochasticity comes from TFB
+                        num_beams=1,
+                        num_return_sequences=1,
+                    )
+                    all_sequences.append(out.sequences)
+                    # Stack scores: [seq_len, batch, vocab] -> [batch, seq_len, vocab]
+                    stacked_scores = torch.stack(out.scores, dim=1)
+                    all_logits.append(stacked_scores)
         
         # Disable sampling after generation
         disable_tfb_sampling(model.model)
