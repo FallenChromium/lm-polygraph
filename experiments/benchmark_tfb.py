@@ -35,6 +35,7 @@ def run_reference_bayesian_peft(model_path, adapter_path, beta=0.01, n_samples=1
         "--testing-set", "train_train_val",
         "--anchor-size", "50", # calibration set size
         "--th", "0.01", # Target change ratio
+        "--bayes-train-n-samples", "5", # Ensure sufficient resolution (1/250 = 0.4%)
     ]
     
     print("Executing:", " ".join(cmd))
@@ -153,7 +154,8 @@ Answer:"""
     from lm_polygraph.utils.tfb import update_tfb_beta, fit_tfb_beta, disable_tfb_sampling
     
     # 3. Calibration (Binary Search)
-    cal_dataset = ds_split["train"].select(range(min(200, len(ds_split["train"]))))
+    # Match reference: 50 samples * 5 runs = 250 trials (0.4% resolution)
+    cal_dataset = ds_split["train"].select(range(min(50, len(ds_split["train"]))))
     cal_inputs = [
         tokenizer(
             preamble.format(context=" ".join(item["context"]["contexts"]), question=item["question"]),
@@ -186,7 +188,8 @@ Answer:"""
         model, 
         cal_inputs, 
         target_metric_ratio=0.01, 
-        max_iters=15, 
+        max_iters=10, 
+        n_samples=5, 
         initial_beta=beta,
         metric_fn=classification_acc_metric,
         verbose=True

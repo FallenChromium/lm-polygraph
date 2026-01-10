@@ -233,8 +233,10 @@ def apply_tfb(
             layer.tfb_singular_values[adapter_name] = nn.Parameter(D.to(dtype_B), requires_grad=False)
             
             # Transform: B' = U @ diag(D), A' = V^T @ A
+            # Note: _compute_variance_from_svd uses linalg.svd which returns Vh (V^T).
+            # So V variable holds V^T. We want V^T @ A.
             lora_B.weight = nn.Parameter((U @ torch.diag(D)).to(dtype_B))
-            lora_A.weight = nn.Parameter((V.T @ A_weight).to(dtype_A))
+            lora_A.weight = nn.Parameter((V @ A_weight).to(dtype_A))
         
         layer._tfb_original_forward = layer.forward
         layer.forward = tfb_forward.__get__(layer, type(layer))
