@@ -1,15 +1,15 @@
 """
 TFB (Training-Free Bayesianization) sampling calculator.
 
-Generates multiple stochastic samples from a LoRA-finetuned model
-using TFB weight perturbations.
+Generates stochastic samples from LoRA-finetuned models using TFB weight
+perturbations and computes BMA-based uncertainty statistics.
 """
 
 import torch
 import numpy as np
 import warnings
 
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Tuple, Optional
 
 from .stat_calculator import StatCalculator
 from lm_polygraph.utils.model import WhiteboxModel
@@ -17,92 +17,64 @@ from lm_polygraph.utils.tfb import (
     apply_tfb,
     enable_tfb_sampling,
     disable_tfb_sampling,
-    fit_tfb_beta,
 )
 
 
 class TFBSamplingCalculator(StatCalculator):
     """
-    Generates multiple stochastic samples using TFB (Training-Free Bayesianization).
+    Computes TFB-based uncertainty using Bayesian Model Averaging.
     
-    TFB adds calibrated noise to LoRA weights during inference, producing
-    diverse outputs that reflect model uncertainty. Unlike MC Dropout or
-    temperature sampling, TFB noise is derived from the learned LoRA structure
-    via SVD, providing principled Bayesian uncertainty.
+    For each input, runs n_samples stochastic forward passes with TFB weight
+    perturbations, then averages probabilities (BMA) for uncertainty estimation.
+    
+    Optionally generates text samples when max_new_tokens > 0.
     
     Requirements:
         - Model must be a PEFT model with LoRA adapters
-        - PEFT library must be installed
     
     Example:
-        >>> from lm_polygraph.stat_calculators import TFBSamplingCalculator
-        >>> calculator = TFBSamplingCalculator(n_samples=10, beta=0.2)
-        >>> stats = calculator({}, texts, model, max_new_tokens=100)
+        >>> calculator = TFBSamplingCalculator(n_samples=10, beta=0.01)
+        >>> stats = calculator({}, texts, model)
+        >>> uncertainty = stats["tfb_mean_std"]
     """
 
     @staticmethod
     def meta_info() -> Tuple[List[str], List[str]]:
-        """
-        Returns the statistics and dependencies for the calculator.
-        
-        Statistics produced:
-            - tfb_sample_log_probs: Sum of log probs for each sample
-            - tfb_sample_tokens: Token IDs for each sample
-            - tfb_sample_texts: Decoded text for each sample
-            - tfb_sample_log_likelihoods: Per-token log probs for each sample
-        """
         return [
+            "tfb_bma_probs",
+            "tfb_mean_std",
             "tfb_sample_log_probs",
-            "tfb_sample_tokens",
             "tfb_sample_texts",
-            "tfb_sample_log_likelihoods",
         ], []
 
     def __init__(
         self,
         n_samples: int = 10,
-        beta: float = 0.2,
+        beta: float = 0.01,
+        target_ids: Optional[List[int]] = None,
         use_softplus: bool = False,
         auto_apply_tfb: bool = True,
-        parallel: bool = False,
     ):
         """
-        Initialize TFB sampling calculator.
-        
         Args:
-            n_samples: Number of stochastic samples to generate per input.
-                       More samples = better uncertainty estimates but slower.
-                       Default: 10
-            beta: Variance scaling parameter for TFB noise. Higher values
-                  produce more diverse samples. Default: 0.2
-            use_softplus: If True, use softplus variance parameterization.
-                          If False, use squared parameterization (default).
-            auto_apply_tfb: If True, automatically apply TFB to model on first
-                            call if not already applied. Default: True
+            n_samples: Stochastic samples for BMA. Default: 10
+            beta: Variance scale for TFB noise. Default: 0.01
+            target_ids: Token IDs to restrict classification. None = full vocab.
+            use_softplus: Variance parameterization. Default: False (squared).
+            auto_apply_tfb: Auto-apply TFB if not applied. Default: True
         """
         super().__init__()
         self.n_samples = n_samples
         self.beta = beta
+        self.target_ids = target_ids
         self.use_softplus = use_softplus
         self.auto_apply_tfb = auto_apply_tfb
         self._tfb_applied = False
-        self.parallel = parallel
 
     def _ensure_tfb_applied(self, model: WhiteboxModel) -> None:
-        """
-        Ensure TFB modifications are applied to the model.
-        
-        Args:
-            model: WhiteboxModel wrapping a PEFT model
-            
-        Raises:
-            ValueError: If model is not compatible with TFB
-        """
         if self._tfb_applied:
             return
         
-        
-        # Check if TFB is already applied
         tfb_already_applied = any(
             hasattr(m, 'tfb_sampling_enabled') 
             for m in model.model.modules()
@@ -113,168 +85,104 @@ class TFBSamplingCalculator(StatCalculator):
             return
         
         if not self.auto_apply_tfb:
-            raise ValueError(
-                "TFB has not been applied to this model. Either call "
-                "apply_tfb(model.model) first, or set auto_apply_tfb=True."
-            )
+            raise ValueError("TFB not applied. Call apply_tfb() or set auto_apply_tfb=True.")
         
-        # Auto-apply TFB
-        try:
-            apply_tfb(model.model, beta=self.beta, use_softplus=self.use_softplus)
-            self._tfb_applied = True
-        except ValueError as e:
-            raise ValueError(
-                f"Failed to apply TFB: {e}. "
-                "Ensure your model is a PEFT model with LoRA adapters."
-            ) from e
+        apply_tfb(model.model, beta=self.beta, use_softplus=self.use_softplus)
+        self._tfb_applied = True
 
     def __call__(
         self,
         dependencies: Dict[str, np.ndarray],
         texts: List[str],
         model: WhiteboxModel,
-        max_new_tokens: int = 100,
+        max_new_tokens: int = 0,
         **kwargs,
     ) -> Dict[str, np.ndarray]:
         """
-        Generate TFB samples for input texts.
+        Compute TFB statistics with BMA.
         
         Args:
-            dependencies: Input statistics (not used, can be empty)
-            texts: Input texts batch for generation
-            model: WhiteboxModel with PEFT/LoRA model
-            max_new_tokens: Maximum tokens to generate. Default: 100
+            dependencies: Not used
+            texts: Input texts
+            model: WhiteboxModel with LoRA
+            max_new_tokens: If > 0, also generate text samples
             
         Returns:
-            Dictionary with:
-                - tfb_sample_log_probs: List[List[float]] - sum log prob per sample
-                - tfb_sample_tokens: List[List[List[int]]] - tokens per sample
-                - tfb_sample_texts: List[List[str]] - decoded texts per sample
-                - tfb_sample_log_likelihoods: List[List[List[float]]] - per-token log probs
+            tfb_bma_probs: BMA-averaged next-token probs
+            tfb_mean_std: Uncertainty score (mean prob std across samples)
+            tfb_sample_log_probs: Per-sample sequence log probs
+            tfb_sample_texts: Generated texts (only if max_new_tokens > 0)
         """
         self._ensure_tfb_applied(model)
         
-        # Tokenize inputs
-        batch: Dict[str, torch.Tensor] = model.tokenize(texts)
+        batch = model.tokenize(texts)
         batch = {k: v.to(model.device()) for k, v in batch.items()}
-        
         batch_size = len(texts)
+        device = model.device()
         
-        # Storage for all samples
-        all_sequences = []
-        all_logits = []
+        target_tensor = None
+        if self.target_ids is not None:
+            target_tensor = torch.tensor(self.target_ids, device=device)
         
-        # Enable TFB sampling
+        # Collect stochastic samples
         enable_tfb_sampling(model.model)
+        all_probs = []
+        all_log_probs = []
+        all_texts = [[] for _ in range(batch_size)]
         
-        # Generate samples
         with torch.no_grad():
-            if self.parallel and self.n_samples > 1:
-                # Parallel generation: batch repetition
-                batch_repeated = {}
-                for k, v in batch.items():
-                    # k is 'input_ids' or 'attention_mask' of shape [batch, len]
-                    # we need [batch*n, len]
-                    # repeat_interleave keeps (b1, b1, ..., b2, b2) grouping
-                    batch_repeated[k] = v.repeat_interleave(self.n_samples, dim=0)
-                
-                out = model.generate(
-                    **batch_repeated,
-                    output_scores=True,
-                    return_dict_in_generate=True,
-                    max_new_tokens=max_new_tokens,
-                    min_new_tokens=2,
-                    do_sample=False,
-                    num_beams=1,
-                    num_return_sequences=1,
-                )
-                
-                # Unpack results: [batch*n, len] -> n x [batch, len]
-                # Since we used repeat_interleave, results are grouped by batch elem
-                # b1_s1, b1_s2, ..., b2_s1, b2_s2
-                
-                total_sequences = out.sequences
-                total_scores = torch.stack(out.scores, dim=1) # [batch*n, gen_len, vocab]
-                
-                for sample_idx in range(self.n_samples):
-
-                    indices = torch.arange(sample_idx, len(total_sequences), self.n_samples, device=model.device())
-
-                    all_sequences.append(total_sequences[indices])
-                    all_logits.append(total_scores[indices])
-
-            else:
-                # Sequential generation
-                for _ in range(self.n_samples):
+            for _ in range(self.n_samples):
+                if max_new_tokens > 0:
                     out = model.generate(
                         **batch,
                         output_scores=True,
                         return_dict_in_generate=True,
                         max_new_tokens=max_new_tokens,
-                        min_new_tokens=2,
-                        do_sample=False,  # Greedy - stochasticity comes from TFB
+                        do_sample=False,
                         num_beams=1,
-                        num_return_sequences=1,
                     )
-                    all_sequences.append(out.sequences)
-                    # Stack scores: [seq_len, batch, vocab] -> [batch, seq_len, vocab]
-                    stacked_scores = torch.stack(out.scores, dim=1)
-                    all_logits.append(stacked_scores)
+                    sequences = out.sequences
+                    scores = torch.stack(out.scores, dim=1)
+                    
+                    for i in range(batch_size):
+                        inp_len = batch["input_ids"][i].shape[0]
+                        gen_tokens = sequences[i][inp_len:]
+                        text = model.tokenizer.decode(gen_tokens, skip_special_tokens=True)
+                        all_texts[i].append(text)
+                        
+                        # Compute log prob of generated sequence
+                        log_prob = 0.0
+                        for j, tok in enumerate(gen_tokens):
+                            if j < scores.shape[1]:
+                                log_prob += torch.log_softmax(scores[i, j], dim=-1)[tok].item()
+                        all_log_probs.append(log_prob) if i == 0 else None
+                    
+                    # Next-token probs from first position
+                    logits = scores[:, 0, :]
+                else:
+                    output = model.model(**batch)
+                    logits = output.logits[:, -1, :]
+                    all_log_probs.append(None)
+                
+                if target_tensor is not None:
+                    logits = logits[:, target_tensor]
+                probs = torch.softmax(logits, dim=-1)
+                all_probs.append(probs)
         
-        # Disable sampling after generation
         disable_tfb_sampling(model.model)
         
-        # Process outputs into statistics
-        log_probs = [[] for _ in range(batch_size)]
-        tokens = [[] for _ in range(batch_size)]
-        decoded_texts = [[] for _ in range(batch_size)]
-        log_likelihoods = [[] for _ in range(batch_size)]
+        # BMA
+        sample_probs = torch.stack(all_probs, dim=0)
+        bma_probs = sample_probs.mean(dim=0)
+        prob_std = sample_probs.std(dim=0)
+        mean_std = prob_std.mean(dim=-1)
         
-        for sample_idx in range(self.n_samples):
-            sequences = all_sequences[sample_idx]
-            logits = all_logits[sample_idx]
-            
-            for batch_idx in range(batch_size):
-                log_prob = 0.0
-                ll = []
-                toks = []
-                
-                # Input size to skip prompt tokens
-                inp_size = len(batch["input_ids"][batch_idx])
-                seq = sequences[batch_idx]
-                seq_logits = logits[batch_idx]  # [gen_len, vocab]
-                
-                # Extract token-level statistics
-                gen_len = len(seq) - inp_size
-                for j in range(min(gen_len, len(seq_logits))):
-                    cur_token = seq[j + inp_size].item()
-                    
-                    # Get log probability of generated token
-                    token_log_prob = seq_logits[j][cur_token].item()
-                    log_prob += token_log_prob
-                    
-                    # Stop at EOS
-                    if cur_token == model.tokenizer.eos_token_id:
-                        break
-                    
-                    ll.append(token_log_prob)
-                    toks.append(cur_token)
-                
-                # Only add if we got tokens
-                if len(toks) > 0:
-                    log_probs[batch_idx].append(log_prob)
-                    tokens[batch_idx].append(toks)
-                    decoded_texts[batch_idx].append(model.tokenizer.decode(toks))
-                    log_likelihoods[batch_idx].append(ll)
-                else:
-                    warnings.warn(
-                        f"No tokens generated for batch {batch_idx}, sample {sample_idx}. "
-                        "This sample will be skipped."
-                    )
-        
-        return {
-            "tfb_sample_log_probs": log_probs,
-            "tfb_sample_tokens": tokens,
-            "tfb_sample_texts": decoded_texts,
-            "tfb_sample_log_likelihoods": log_likelihoods,
+        # Format output
+        result = {
+            "tfb_bma_probs": [bma_probs[i].cpu().numpy().tolist() for i in range(batch_size)],
+            "tfb_mean_std": mean_std.cpu().numpy().tolist(),
+            "tfb_sample_log_probs": [[lp for lp in all_log_probs if lp is not None] for _ in range(batch_size)],
+            "tfb_sample_texts": all_texts if max_new_tokens > 0 else [[] for _ in range(batch_size)],
         }
+        
+        return result

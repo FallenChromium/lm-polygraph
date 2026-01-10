@@ -169,14 +169,18 @@ Answer:"""
         disable_tfb_sampling(m)
         with torch.no_grad():
             det_logits = m(**inputs).logits[:, -1, target_ids_tensor]
-            det_pred = det_logits.argmax(dim=-1)
+            det_probs = torch.softmax(det_logits, dim=-1)
+            det_pred = det_probs.argmax(dim=-1)
 
-        # Stochastic sample
         enable_tfb_sampling(m)
         with torch.no_grad():
-            # Match reference: 1 sample for calibration
-            stoch_logits = m(**inputs).logits[:, -1, target_ids_tensor]
-            stoch_pred = stoch_logits.argmax(dim=-1)
+            all_probs = []
+            for _ in range(n_s):
+                stoch_logits = m(**inputs).logits[:, -1, target_ids_tensor]
+                all_probs.append(torch.softmax(stoch_logits, dim=-1))
+            
+            mean_probs = torch.stack(all_probs).mean(dim=0)
+            stoch_pred = mean_probs.argmax(dim=-1)
             
         # Return mismatch count as "loss". 
         # Baseline at beta=0 will be 0.
