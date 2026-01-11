@@ -50,8 +50,14 @@ def run_reference_bayesian_peft(model_path, adapter_path, beta=0.01, n_samples=1
     
     if result.returncode != 0:
         print("Error running reference script:")
-        print(result.stderr)
+        print("STDERR:", result.stderr)
+        print("STDOUT:", result.stdout)
         return None
+    
+    # Print the subprocess output for debugging
+    print("=== REFERENCE SUBPROCESS OUTPUT ===")
+    print(result.stdout)
+    print("=== END SUBPROCESS OUTPUT ===")
     
     # Instead of stdout, we MUST read the log file because we reverted the print changes in the lib.
     log_file_path = os.path.join(cwd_path, "checkpoints", "tfblora_acc", model_path, "pqa_labeled", "default", "log.txt")
@@ -63,6 +69,10 @@ def run_reference_bayesian_peft(model_path, adapter_path, beta=0.01, n_samples=1
         
     with open(log_file_path, 'r') as f:
         output = f.read()
+    
+    print("=== LOG FILE CONTENT ===")
+    print(output)
+    print("=== END LOG FILE ===")
     
     # Parse NLL, ACC from logs
     # Log format: val_acc: 0.5, val_ece: 0.1, val_nll: 2.3, val_brier: 0.2
@@ -125,13 +135,14 @@ Answer:"""
     # Apply TFB
     apply_tfb(model, beta=beta)
 
-    # Prepare calibration batches
+    # Prepare calibration batches - FIXED to match original logic exactly
     cal_batches = []
     baselines = []
-    disable_tfb_sampling(model)
-    update_tfb_beta(model, 0.0)
-
+    
     print("Pre-computing Calibration Baselines (beta=0)...")
+    update_tfb_beta(model, 0.0)  # Set beta=0 for deterministic baseline
+    disable_tfb_sampling(model)
+    
     with torch.no_grad():
         for i in range(0, len(anchor_ds), 8):
             chunk = anchor_ds.select(range(i, min(i + 8, len(anchor_ds))))
@@ -156,33 +167,45 @@ Answer:"""
             cal_batches.append(batch)
             baselines.append(det_preds)
 
-    cal_inputs_with_baseline = list(zip(cal_batches, baselines))
+    # Flatten baselines to match original format
+    all_baseline_preds = torch.cat(baselines, dim=0)
 
-    def flip_metric(m, args, n_s, parallel=False):
-        inputs, baseline_preds = args
-        samples = []
+    def flip_metric_debug(m, inputs_list, n_s, parallel=False):
+        """Flip ratio metric that matches the original bayesian-peft exactly"""
+        all_stoch_preds = []
+        
+        enable_tfb_sampling(m)
         with torch.no_grad():
-            for _ in range(n_s):
-                logits = m(**inputs).logits
-                idx = last_nonpad(inputs["attention_mask"])
-                b_idx = torch.arange(logits.size(0), device=logits.device)
-                logits = logits[b_idx, idx][:, target_ids_tensor]
-                samples.append(torch.softmax(logits, dim=-1))
-
-        mean_probs = torch.stack(samples).mean(dim=0)
-        stoch_pred = mean_probs.argmax(dim=-1)
-        flip_ratio = (stoch_pred != baseline_preds).float().mean()
+            for inputs in inputs_list:
+                batch_preds = []
+                for _ in range(n_s):
+                    logits = m(**inputs).logits
+                    idx = last_nonpad(inputs["attention_mask"])
+                    b_idx = torch.arange(logits.size(0), device=logits.device)
+                    logits = logits[b_idx, idx][:, target_ids_tensor]
+                    probs = torch.softmax(logits, dim=-1)
+                    batch_preds.append(probs)
+                
+                # Average across samples, then argmax (like original)
+                mean_probs = torch.stack(batch_preds).mean(dim=0)
+                stoch_pred = mean_probs.argmax(dim=-1)
+                all_stoch_preds.append(stoch_pred)
+        
+        all_stoch_preds = torch.cat(all_stoch_preds, dim=0)
+        flip_ratio = (all_stoch_preds != all_baseline_preds).float().mean().item()
+        
+        print(f"    DEBUG: flip_ratio = {flip_ratio:.4f} (target: 0.01)")
         return flip_ratio, None
 
     print("Running Calibration via fit_tfb_beta...")
     best_beta = fit_tfb_beta(
         model,
-        cal_inputs_with_baseline,
+        cal_batches,
         target_metric_ratio=0.01,
         max_iters=10,
         n_samples=5,
         initial_beta=beta,
-        metric_fn=flip_metric,
+        metric_fn=flip_metric_debug,
         verbose=True,
     )
 

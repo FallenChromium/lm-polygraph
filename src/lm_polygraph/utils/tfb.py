@@ -476,9 +476,11 @@ def fit_tfb_beta(
             print(f"Iter {iteration}: beta={mid:.6f}, delta_metric={current_metric:.6f}")
 
         if metric_ratio > target_metric_ratio:
-            best_beta = mid       
+            # Metric degradation too high, reduce beta
             high = mid
         else:
+            # Metric degradation acceptable, try higher beta
+            best_beta = mid
             low = mid
     
     # Set final beta
