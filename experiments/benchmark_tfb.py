@@ -7,7 +7,7 @@ import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 from datasets import load_dataset
-from lm_polygraph.utils.tfb import apply_tfb, enable_tfb_sampling
+from lm_polygraph.utils.tfb import apply_tfb, enable_tfb_sampling, disable_tfb_sampling, update_tfb_beta, fit_tfb_beta
 
 def run_reference_bayesian_peft(model_path, adapter_path, beta=0.01, n_samples=10):
     """
@@ -80,191 +80,143 @@ def run_reference_bayesian_peft(model_path, adapter_path, beta=0.01, n_samples=1
     
     return {"nll": nll, "acc": acc}
 
-def run_candidate_lm_polygraph(model_path, adapter_path, beta=0.01, n_samples=10):
-    """
-    Runs lm-polygraph implementation in-process.
-    """
+def run_candidate_lm_polygraph(model_path, adapter_path, beta=0.01, n_samples=10, anchor_size=50):
+    """Runs lm-polygraph implementation in-process with tokenizer-agnostic last-token selection."""
     print(f"\n--- [Candidate] Running LM-Polygraph (beta={beta}, n_samples={n_samples}) ---")
-    
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+
     # Load Model
     base_model = AutoModelForCausalLM.from_pretrained(model_path)
     model = PeftModel.from_pretrained(base_model, adapter_path)
     model.to(device)
+
+    # Tokenizer aligned with reference defaults, but selection is last-nonpad (Qwen might have issues with left-padding inference though)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        
-    # Apply TFB
-    apply_tfb(model, beta=beta)
-    
-    # Load Data (Identical split to reference)
-    # The reference implementation uses 'validation' or 'test' split depending on args.
-    # S2S_Classification default for "validation" split logic:
-    # We used default args, so it likely loads 'validation' split if testing_set is default?
-    # Actually `main.py` calls `get_loaders`, which loads `test_dataloader` from `validation` split by default.
-    # BUT, 'pqa_labeled' only has 'train'.
-    # Our Adapter loads 'pqa_labeled'. If we didn't specify split mapping, `load_dataset("qiaojin/PubMedQA", "pqa_labeled")`
-    # returns a DatasetDict with 'train'.
-    
-    # Update: In my adapter `PubMedQADataset.__init__`, I did:
-    # dset = load_dataset(...)
-    # S2ClassDataset.loader calls `dset[split]`.
-    # Since pqa only has train, I should map 'validation' to 'train' or handle it.
-    # Wait, my adapter didn't handle splits carefully. It just loaded the dataset. 
-    # If `dsets.py` logic tries `dset['validation']`, it will fail if the dict only has 'train'.
-    # I should check PubMedQA structure. It usually has train.
-    # If my adapter fails in the subprocess, I will see it.
-    
-    # Assume we are using the 'train' split for now. 
+
+    # Dataset split consistent with reference (seed=42, 90/10)
     dataset_full = load_dataset("qiaojin/PubMedQA", "pqa_labeled", split="train")
     ds_split = dataset_full.train_test_split(test_size=0.1, seed=42)
-    dataset = ds_split["test"] # Matches 'validation' split in dsets.py
-    # For fair bench, define a subset.
-    # bayesian-peft doesn't subsample unless requested. 
-    # It runs on the full split provided. 
-    # To save time, we should probably stick to a small subset, but I didn't set that in Ref args.
-    # I'll let it run on full (1000 samples) or maybe just 50 if I can control it.
-    # bayesian-peft uses `--bayes-eval-n-samples`? No that's stochastic samples.
-    # Use `--anchor-size` or custom logic?
-    
-    # Let's match the PRECISE logic of the reference adapter I wrote.
-    # My Adapter uses:
-    # context = e["context"]["contexts"]
-    # question = e["question"]
-    # Preamble: "Answer the question with yes, no, or maybe based on the context.\n\nContext: {context}\nQuestion: {question}\nAnswer:"
-    
-    # Labels: " yes", " no", " maybe" (with space if add_space=True, which is default)
-    # Target IDs: [tokenizer(' yes'), ...]
-    
-    target_words = [" yes", " no", " maybe"]
-    target_ids = [tokenizer.encode(w, add_special_tokens=False)[0] for w in target_words]
-    target_ids_tensor = torch.tensor(target_ids).to(device)
+    anchor_ds = ds_split["train"].select(range(min(anchor_size, len(ds_split["train"]))))
+    eval_ds = ds_split["test"]
+
+    # Targets from tokenizer (leading space labels like reference)
+    labels = [" yes", " no", " maybe"]
     label_map = {"yes": 0, "no": 1, "maybe": 2}
-    
+    target_ids = tokenizer(labels, add_special_tokens=False).input_ids
+    target_ids = [ids[0] for ids in target_ids]
+    target_ids_tensor = torch.tensor(target_ids, device=device)
+
     preamble = """Answer the question with yes, no, or maybe based on the context.
 
 Context: {context}
 Question: {question}
 Answer:"""
 
-    nll_vals = []
-    
-    from lm_polygraph.utils.tfb import update_tfb_beta, fit_tfb_beta, disable_tfb_sampling
-    
-    # 3. Calibration (Binary Search)
-    # Match reference: 50 samples * 5 runs = 250 trials (0.4% resolution)
-    # Use Data Collator for batching (matches Reference logic)
+    def last_nonpad(mask: torch.Tensor) -> torch.Tensor:
+        return mask.sum(dim=1) - 1
+
     from transformers import DataCollatorWithPadding
     collator = DataCollatorWithPadding(tokenizer=tokenizer, padding="longest")
-    
-    cal_dataset_subset = ds_split["train"].select(range(min(50, len(ds_split["train"]))))
-    
-    # Prepare samples first
-    cal_samples = []
-    for item in cal_dataset_subset:
-        prompt = preamble.format(context=" ".join(item["context"]["contexts"]), question=item["question"])
-        tokens = tokenizer(prompt, truncation=True, max_length=512)
-        cal_samples.append(tokens)
-    
-    # Batch them
-    batch_size = 8
+
+    # Apply TFB
+    apply_tfb(model, beta=beta)
+
+    # Prepare calibration batches
     cal_batches = []
-    # Pre-compute baselines for each batch
     baselines = []
-    
-    # Disable sampling for baseline computation
     disable_tfb_sampling(model)
-    update_tfb_beta(model, 0.0) # Ensure zero noise
-    
+    update_tfb_beta(model, 0.0)
+
     print("Pre-computing Calibration Baselines (beta=0)...")
     with torch.no_grad():
-        for i in range(0, len(cal_samples), batch_size):
-            batch_items = cal_samples[i : i + batch_size]
-            batch = collator(batch_items)
+        for i in range(0, len(anchor_ds), 8):
+            chunk = anchor_ds.select(range(i, min(i + 8, len(anchor_ds))))
+            prompts = [
+                preamble.format(
+                    context=" ".join(e["context"]["contexts"]),
+                    question=e["question"],
+                )
+                for e in chunk
+            ]
+            tokenized = [tokenizer(p, truncation=True, max_length=512) for p in prompts]
+            batch = collator(tokenized)
             batch = {k: v.to(device) for k, v in batch.items()}
-            
-            # Deterministic Baseline
-            det_logits = model(**batch).logits[:, -1, target_ids_tensor]
-            det_probs = torch.softmax(det_logits, dim=-1)
+
+            logits = model(**batch).logits
+            idx = last_nonpad(batch["attention_mask"])
+            b_idx = torch.arange(logits.size(0), device=logits.device)
+            logits = logits[b_idx, idx][:, target_ids_tensor]
+            det_probs = torch.softmax(logits, dim=-1)
             det_preds = det_probs.argmax(dim=-1)
-            
+
             cal_batches.append(batch)
             baselines.append(det_preds)
-            
-    # Zip them for fit_tfb_beta
-    # fit_tfb_beta will iterate this list.
-    # Each item is (inputs, baseline_preds)
+
     cal_inputs_with_baseline = list(zip(cal_batches, baselines))
-    
-    def classification_acc_metric(m, args, n_s, p=False):
-        # args is (inputs, baseline_preds)
+
+    def flip_metric(m, args, n_s, parallel=False):
         inputs, baseline_preds = args
-        
-        # Enable sampling is handled by fit_tfb_beta loop logic usually?
-        # fit_tfb_beta calls: enable_tfb_sampling(model) before metric_fn.
-        
+        samples = []
         with torch.no_grad():
-            all_probs = []
             for _ in range(n_s):
-                stoch_logits = m(**inputs).logits[:, -1, target_ids_tensor]
-                all_probs.append(torch.softmax(stoch_logits, dim=-1))
-            
-            mean_probs = torch.stack(all_probs).mean(dim=0)
-            stoch_pred = mean_probs.argmax(dim=-1)
-            
-        # Return mismatch count from FIXED baseline
-        return (stoch_pred != baseline_preds).float().mean(), None
+                logits = m(**inputs).logits
+                idx = last_nonpad(inputs["attention_mask"])
+                b_idx = torch.arange(logits.size(0), device=logits.device)
+                logits = logits[b_idx, idx][:, target_ids_tensor]
+                samples.append(torch.softmax(logits, dim=-1))
+
+        mean_probs = torch.stack(samples).mean(dim=0)
+        stoch_pred = mean_probs.argmax(dim=-1)
+        flip_ratio = (stoch_pred != baseline_preds).float().mean()
+        return flip_ratio, None
 
     print("Running Calibration via fit_tfb_beta...")
     best_beta = fit_tfb_beta(
-        model, 
-        cal_inputs_with_baseline, 
-        target_metric_ratio=0.01, 
-        max_iters=10, 
-        n_samples=5, 
+        model,
+        cal_inputs_with_baseline,
+        target_metric_ratio=0.01,
+        max_iters=10,
+        n_samples=5,
         initial_beta=beta,
-        metric_fn=classification_acc_metric,
-        verbose=True
+        metric_fn=flip_metric,
+        verbose=True,
     )
-    
+
     print(f"Optimal Beta found: {best_beta:.6f}")
     update_tfb_beta(model, best_beta)
     enable_tfb_sampling(model)
-    
-    # Limit to first 50 samples for speed if not controllable in Ref?
-    # Ref runs full set. PQA is 1k samples. Might take a while.
-    # 0.5B model is fast. 1k * 10 samples ~ 1 minute on GPU.
-    
+
+    nll_vals = []
     with torch.no_grad():
-        for i, item in enumerate(dataset):
-            # Prep Input
-            context_str = " ".join(item["context"]["contexts"]) # Match dsets.py formatting
-            prompt = preamble.format(context=context_str, question=item["question"])
-            
-            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(device)
-            
-            # Stochastic loop
-            sample_probs = []
+        for item in eval_ds:
+            prompt = preamble.format(
+                context=" ".join(item["context"]["contexts"]),
+                question=item["question"],
+            )
+            batch = tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+            ).to(device)
+
+            probs = []
             for _ in range(n_samples):
-                out = model(**inputs)
-                logits = out.logits[:, -1, :] # [1, vocab]
-                
-                # Filter targets
-                target_l = logits[:, target_ids_tensor] # [1, 3]
-                probs = torch.softmax(target_l, dim=-1)
-                sample_probs.append(probs)
-            
-            # Mean
-            mean_probs = torch.stack(sample_probs).mean(dim=0) # [1, 3]
-            
-            # Get metric
-            true_label_idx = label_map[item["final_decision"]]
-            prob_true = mean_probs[0, true_label_idx].item()
-            nll_vals.append(-np.log(prob_true + 1e-12))
-            
-    return {"nll": np.mean(nll_vals)}
+                logits = model(**batch).logits
+                idx = last_nonpad(batch["attention_mask"])
+                b_idx = torch.arange(logits.size(0), device=logits.device)
+                logits = logits[b_idx, idx][:, target_ids_tensor]
+                probs.append(torch.softmax(logits, dim=-1))
+
+            mean_probs = torch.stack(probs).mean(dim=0)
+            true_idx = label_map[item["final_decision"]]
+            nll_vals.append(-np.log(mean_probs[0, true_idx].item() + 1e-12))
+
+    return {"nll": float(np.mean(nll_vals))}
 
 def main():
     # Use a small model for speed

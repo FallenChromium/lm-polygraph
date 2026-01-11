@@ -14,6 +14,19 @@ import torch.nn as nn
 from typing import List, Callable, Optional, Tuple
 
 
+def _gather_last_token(logits: torch.Tensor, inputs: dict) -> torch.Tensor:
+    """
+    Select logits at the last non-padding token when attention_mask is provided;
+    fall back to the final position otherwise.
+    """
+    if 'attention_mask' in inputs:
+        mask = inputs['attention_mask']
+        last_idx = mask.sum(dim=1) - 1
+        batch_idx = torch.arange(logits.size(0), device=logits.device)
+        return logits[batch_idx, last_idx, :]
+    return logits[:, -1, :]
+
+
 def _extract_lora_layers(model: nn.Module) -> List[Tuple[str, nn.Module]]:
     """
     Extract all LoRA layers from a PEFT model.
@@ -336,9 +349,10 @@ def _default_nll_metric(
     disable_tfb_sampling(model)
     with torch.no_grad():
         det_output = model(**inputs)
-        det_logits = det_output.logits[:, -1, :]  # Last token logits
+        det_logits = _gather_last_token(det_output.logits, inputs)
         det_probs = torch.softmax(det_logits, dim=-1)
         det_preds = det_logits.argmax(dim=-1)
+        det_nll = -torch.log(det_probs.gather(1, det_preds.unsqueeze(1)) + 1e-12).mean()
     
     # Get stochastic predictions
     enable_tfb_sampling(model)
@@ -354,7 +368,7 @@ def _default_nll_metric(
                 batch_inputs[k] = v_repeated
                 
             output = model(**batch_inputs)
-            logits = output.logits[:, -1, :]  # [batch * n, vocab]
+            logits = _gather_last_token(output.logits, batch_inputs)
             probs = torch.softmax(logits, dim=-1)
             
             # Reshape stats: [batch * n, vocab] -> [n, batch, vocab]
@@ -369,17 +383,18 @@ def _default_nll_metric(
             # Sequential: run n times
             for _ in range(n_samples):
                 output = model(**inputs)
-                logits = output.logits[:, -1, :]
+                logits = _gather_last_token(output.logits, inputs)
                 probs = torch.softmax(logits, dim=-1)
                 all_probs.append(probs)
     
     # Average probabilities across samples
     mean_probs = torch.stack(all_probs).mean(dim=0)
-    
-    # NLL of deterministic prediction under stochastic model
-    nll = -torch.log(mean_probs.gather(1, det_preds.unsqueeze(1)) + 1e-12).mean()
-    
-    return nll, det_probs
+
+    # NLL of deterministic prediction under stochastic model (same target as det)
+    stoch_nll = -torch.log(mean_probs.gather(1, det_preds.unsqueeze(1)) + 1e-12).mean()
+
+    # Return delta to make calibration threshold relative to deterministic baseline
+    return stoch_nll - det_nll, det_nll
 
 
 def fit_tfb_beta(
@@ -458,8 +473,8 @@ def fit_tfb_beta(
         metric_ratio = current_metric
 
         if verbose:
-            print(f"Iter {iteration}: beta={mid:.6f}, metric={current_metric:.6f}")
-        
+            print(f"Iter {iteration}: beta={mid:.6f}, delta_metric={current_metric:.6f}")
+
         if metric_ratio > target_metric_ratio:
             best_beta = mid       
             high = mid
@@ -548,7 +563,7 @@ def tfb_predict_bma(
     disable_tfb_sampling(model)
     with torch.no_grad():
         det_output = model(**inputs)
-        det_logits = det_output.logits[:, -1, :]
+        det_logits = _gather_last_token(det_output.logits, inputs)
         if target_ids is not None:
             det_logits = det_logits[:, target_ids]
         det_probs = torch.softmax(det_logits, dim=-1)
@@ -560,7 +575,7 @@ def tfb_predict_bma(
     with torch.no_grad():
         for _ in range(n_samples):
             output = model(**inputs)
-            logits = output.logits[:, -1, :]
+            logits = _gather_last_token(output.logits, inputs)
             if target_ids is not None:
                 logits = logits[:, target_ids]
             probs = torch.softmax(logits, dim=-1)

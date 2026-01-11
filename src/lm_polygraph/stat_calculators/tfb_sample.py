@@ -127,7 +127,7 @@ class TFBSamplingCalculator(StatCalculator):
         # Collect stochastic samples
         enable_tfb_sampling(model.model)
         all_probs = []
-        all_log_probs = []
+        all_log_probs: List[List[float]] = [[] for _ in range(batch_size)]
         all_texts = [[] for _ in range(batch_size)]
         
         with torch.no_grad():
@@ -155,14 +155,19 @@ class TFBSamplingCalculator(StatCalculator):
                         for j, tok in enumerate(gen_tokens):
                             if j < scores.shape[1]:
                                 log_prob += torch.log_softmax(scores[i, j], dim=-1)[tok].item()
-                        all_log_probs.append(log_prob) if i == 0 else None
+                        all_log_probs[i].append(log_prob)
                     
                     # Next-token probs from first position
                     logits = scores[:, 0, :]
                 else:
                     output = model.model(**batch)
-                    logits = output.logits[:, -1, :]
-                    all_log_probs.append(None)
+                    logits = output.logits
+                    if "attention_mask" in batch:
+                        last_token_idxs = batch["attention_mask"].sum(dim=1) - 1
+                        idx = torch.arange(logits.shape[0], device=logits.device)
+                        logits = logits[idx, last_token_idxs]
+                    else:
+                        logits = logits[:, -1, :]
                 
                 if target_tensor is not None:
                     logits = logits[:, target_tensor]
@@ -181,7 +186,7 @@ class TFBSamplingCalculator(StatCalculator):
         result = {
             "tfb_bma_probs": [bma_probs[i].cpu().numpy().tolist() for i in range(batch_size)],
             "tfb_mean_std": mean_std.cpu().numpy().tolist(),
-            "tfb_sample_log_probs": [[lp for lp in all_log_probs if lp is not None] for _ in range(batch_size)],
+            "tfb_sample_log_probs": all_log_probs,
             "tfb_sample_texts": all_texts if max_new_tokens > 0 else [[] for _ in range(batch_size)],
         }
         
