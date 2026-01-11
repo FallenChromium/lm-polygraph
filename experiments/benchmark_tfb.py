@@ -113,8 +113,8 @@ def run_candidate_lm_polygraph(model_path, adapter_path, beta=0.01, n_samples=10
     anchor_ds = ds_split["train"].select(range(min(anchor_size, len(ds_split["train"]))))
     eval_ds = ds_split["test"]
 
-    # Targets from tokenizer (leading space labels like reference)
-    labels = [" yes", " no", " maybe"]
+    # Targets from tokenizer - NO leading space to match reference implementation
+    labels = ["yes", "no", "maybe"]
     label_map = {"yes": 0, "no": 1, "maybe": 2}
     target_ids = tokenizer(labels, add_special_tokens=False).input_ids
     target_ids = [ids[0] for ids in target_ids]
@@ -143,6 +143,9 @@ Answer:"""
     update_tfb_beta(model, 0.0)  # Set beta=0 for deterministic baseline
     disable_tfb_sampling(model)
     
+    # Collect ground truth labels alongside batches
+    ground_truth_per_batch = []
+    
     with torch.no_grad():
         for i in range(0, len(anchor_ds), 8):
             chunk = anchor_ds.select(range(i, min(i + 8, len(anchor_ds))))
@@ -153,6 +156,10 @@ Answer:"""
                 )
                 for e in chunk
             ]
+            # Ground truth labels
+            gt_classes = torch.tensor([label_map[e["final_decision"]] for e in chunk], device=device)
+            ground_truth_per_batch.append(gt_classes)
+            
             tokenized = [tokenizer(p, truncation=True, max_length=512) for p in prompts]
             batch = collator(tokenized)
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -167,34 +174,78 @@ Answer:"""
             cal_batches.append(batch)
             baselines.append(det_preds)
 
-    # Flatten baselines to match original format
+    # Debug: print target IDs and baseline predictions
+    print(f"DEBUG [Candidate] target_ids: {target_ids} (tokens: {[tokenizer.decode([t]) for t in target_ids]})")
+    print(f"DEBUG [Candidate] pad_token_id: {tokenizer.pad_token_id}, eos_token_id: {tokenizer.eos_token_id}")
+    
     all_baseline_preds = torch.cat(baselines, dim=0)
-
-    def flip_metric_debug(m, inputs_list, n_s, parallel=False):
-        """Flip ratio metric that matches the original bayesian-peft exactly"""
-        all_stoch_preds = []
+    all_ground_truth = torch.cat(ground_truth_per_batch, dim=0)
+    
+    print(f"DEBUG [Candidate] Baseline predictions (beta=0):")
+    print(f"  Ground truth distribution: {torch.bincount(all_ground_truth, minlength=len(target_ids)).tolist()}")
+    print(f"  Predicted class distribution: {torch.bincount(all_baseline_preds, minlength=len(target_ids)).tolist()}")
+    print(f"  First 10 ground truth: {all_ground_truth[:10].tolist()}")
+    print(f"  First 10 predictions (class idx): {all_baseline_preds[:10].tolist()}")
+    baseline_acc = (all_baseline_preds == all_ground_truth).float().mean().item()
+    print(f"  Baseline accuracy vs ground truth: {baseline_acc:.4f}")
+    
+    # Also check: what is the model's RAW top prediction (not restricted to target_ids)?
+    print("DEBUG [Candidate] Checking raw model output (unrestricted vocab):")
+    with torch.no_grad():
+        test_batch = cal_batches[0]
+        raw_logits = model(**test_batch).logits
+        idx = last_nonpad(test_batch["attention_mask"])
+        seq_len = test_batch["input_ids"].shape[1]
+        print(f"  Sequence length: {seq_len}, last_token_idx[0]: {idx[0].item()}")
+        print(f"  Attention mask[0] sum: {test_batch['attention_mask'][0].sum().item()}")
+        print(f"  Last 5 tokens of input_ids[0]: {test_batch['input_ids'][0, -5:].tolist()}")
+        print(f"  Last 5 tokens decoded: {[tokenizer.decode([t]) for t in test_batch['input_ids'][0, -5:].tolist()]}")
+        print(f"  Token at last_token_idx: {test_batch['input_ids'][0, idx[0]].item()} -> '{tokenizer.decode([test_batch['input_ids'][0, idx[0]].item()])}'")
         
+        b_idx = torch.arange(raw_logits.size(0), device=raw_logits.device)
+        last_token_logits = raw_logits[b_idx, idx]  # [batch, vocab]
+        raw_top5 = torch.topk(last_token_logits[0], 5)
+        print(f"  First sample ground truth class: {all_ground_truth[0].item()} -> token: {tokenizer.decode([target_ids[all_ground_truth[0].item()]])}")
+        print(f"  First sample top-5 token ids: {raw_top5.indices.tolist()}")
+        print(f"  First sample top-5 tokens: {[tokenizer.decode([t]) for t in raw_top5.indices.tolist()]}")
+        print(f"  First sample top-5 logits: {raw_top5.values.tolist()}")
+        print(f"  Logits at target_ids: {last_token_logits[0, target_ids_tensor].tolist()}")
+    
+    # Store baselines per-batch for the metric function
+    baseline_preds_per_batch = baselines  # list of tensors, one per batch
+
+    def flip_metric_single_batch(m, inputs, n_s, parallel=False):
+        """Flip ratio for a single batch - called by fit_tfb_beta for each calibration input"""
+        # Find which batch index this is
+        batch_idx = None
+        for i, cal_batch in enumerate(cal_batches):
+            if cal_batch is inputs or (cal_batch['input_ids'].shape == inputs['input_ids'].shape and 
+                                        torch.equal(cal_batch['input_ids'], inputs['input_ids'])):
+                batch_idx = i
+                break
+        
+        if batch_idx is None:
+            print("WARNING: Could not find batch index!")
+            return 0.0, None
+        
+        baseline_preds = baseline_preds_per_batch[batch_idx]
+        
+        batch_preds = []
         enable_tfb_sampling(m)
         with torch.no_grad():
-            for inputs in inputs_list:
-                batch_preds = []
-                for _ in range(n_s):
-                    logits = m(**inputs).logits
-                    idx = last_nonpad(inputs["attention_mask"])
-                    b_idx = torch.arange(logits.size(0), device=logits.device)
-                    logits = logits[b_idx, idx][:, target_ids_tensor]
-                    probs = torch.softmax(logits, dim=-1)
-                    batch_preds.append(probs)
-                
-                # Average across samples, then argmax (like original)
-                mean_probs = torch.stack(batch_preds).mean(dim=0)
-                stoch_pred = mean_probs.argmax(dim=-1)
-                all_stoch_preds.append(stoch_pred)
+            for _ in range(n_s):
+                logits = m(**inputs).logits
+                idx = last_nonpad(inputs["attention_mask"])
+                b_idx = torch.arange(logits.size(0), device=logits.device)
+                logits = logits[b_idx, idx][:, target_ids_tensor]
+                probs = torch.softmax(logits, dim=-1)
+                batch_preds.append(probs)
         
-        all_stoch_preds = torch.cat(all_stoch_preds, dim=0)
-        flip_ratio = (all_stoch_preds != all_baseline_preds).float().mean().item()
+        # Average across samples, then argmax (like original)
+        mean_probs = torch.stack(batch_preds).mean(dim=0)
+        stoch_pred = mean_probs.argmax(dim=-1)
         
-        print(f"    DEBUG: flip_ratio = {flip_ratio:.4f} (target: 0.01)")
+        flip_ratio = (stoch_pred != baseline_preds).float().mean().item()
         return flip_ratio, None
 
     print("Running Calibration via fit_tfb_beta...")
@@ -205,7 +256,7 @@ Answer:"""
         max_iters=10,
         n_samples=5,
         initial_beta=beta,
-        metric_fn=flip_metric_debug,
+        metric_fn=flip_metric_single_batch,
         verbose=True,
     )
 
