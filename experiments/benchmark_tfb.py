@@ -96,10 +96,13 @@ def run_candidate_lm_polygraph(model_path, adapter_path, beta=0.01, n_samples=10
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Load Model
-    base_model = AutoModelForCausalLM.from_pretrained(model_path)
+    # Load Model with 8-bit quantization to match reference memory usage
+    base_model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        load_in_8bit=True,
+        device_map="auto",
+    )
     model = PeftModel.from_pretrained(base_model, adapter_path)
-    model.to(device)
 
     # Tokenizer aligned with reference defaults, but selection is last-nonpad (Qwen might have issues with left-padding inference though)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -108,21 +111,20 @@ def run_candidate_lm_polygraph(model_path, adapter_path, beta=0.01, n_samples=10
         tokenizer.pad_token = tokenizer.eos_token
 
     dataset_full = load_dataset("boolq")
-    anchor_ds = dataset_full["train"].select(range(min(anchor_size, len(ds_split["train"]))))
+    anchor_ds = dataset_full["train"].select(range(min(anchor_size, len(dataset_full["train"]))))
     eval_ds = dataset_full["validation"]
 
-    # Targets from tokenizer - NO leading space to match reference implementation
-    labels = ["yes", "no", "maybe"]
-    label_map = {"yes": 0, "no": 1, "maybe": 2}
+    # Targets from tokenizer - Use "True"/"False" to match reference implementation
+    labels = ["True", "False"]
+    label_map = {"yes": 0, "no": 1}
     target_ids = tokenizer(labels, add_special_tokens=False).input_ids
     target_ids = [ids[0] for ids in target_ids]
     target_ids_tensor = torch.tensor(target_ids, device=device)
 
-    preamble = """Answer the question with yes, no, or maybe based on the context.
-
-Context: {context}
+    # Match reference prompt format exactly
+    preamble = """Context: {context}
 Question: {question}
-Answer:"""
+Answer (true or false):"""
 
     def last_nonpad(mask: torch.Tensor) -> torch.Tensor:
         return mask.sum(dim=1) - 1
@@ -149,13 +151,13 @@ Answer:"""
             chunk = anchor_ds.select(range(i, min(i + 8, len(anchor_ds))))
             prompts = [
                 preamble.format(
-                    context=" ".join(e["context"]["contexts"]),
+                    context=e["passage"],
                     question=e["question"],
                 )
                 for e in chunk
             ]
-            # Ground truth labels
-            gt_classes = torch.tensor([label_map[e["final_decision"]] for e in chunk], device=device)
+            # Ground truth labels - map answer to 0/1
+            gt_classes = torch.tensor([1 if e["answer"] else 0 for e in chunk], device=device)
             ground_truth_per_batch.append(gt_classes)
             
             tokenized = [tokenizer(p, truncation=True, max_length=512) for p in prompts]
@@ -262,31 +264,46 @@ Answer:"""
     update_tfb_beta(model, best_beta)
     enable_tfb_sampling(model)
 
+    # Process evaluation in batches for efficiency
     nll_vals = []
+    eval_batch_size = 8
+    
     with torch.no_grad():
-        for item in eval_ds:
-            prompt = preamble.format(
-                context=" ".join(item["context"]["contexts"]),
-                question=item["question"],
-            )
-            batch = tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=512,
-            ).to(device)
-
-            probs = []
+        for i in range(0, len(eval_ds), eval_batch_size):
+            chunk = eval_ds.select(range(i, min(i + eval_batch_size, len(eval_ds))))
+            prompts = [
+                preamble.format(
+                    context=e["passage"],
+                    question=e["question"],
+                )
+                for e in chunk
+            ]
+            
+            tokenized = [tokenizer(p, truncation=True, max_length=512) for p in prompts]
+            batch = collator(tokenized)
+            batch = {k: v.to(device) for k, v in batch.items()}
+            
+            # Collect samples
+            batch_probs = []
             for _ in range(n_samples):
                 logits = model(**batch).logits
                 idx = last_nonpad(batch["attention_mask"])
                 b_idx = torch.arange(logits.size(0), device=logits.device)
                 logits = logits[b_idx, idx][:, target_ids_tensor]
-                probs.append(torch.softmax(logits, dim=-1))
-
-            mean_probs = torch.stack(probs).mean(dim=0)
-            true_idx = label_map[item["final_decision"]]
-            nll_vals.append(-np.log(mean_probs[0, true_idx].item() + 1e-12))
+                batch_probs.append(torch.softmax(logits, dim=-1))
+            
+            # BMA per sample
+            mean_probs = torch.stack(batch_probs).mean(dim=0)
+            
+            # Compute NLL for each item in batch
+            for j, item in enumerate(chunk):
+                true_idx = 1 if item["answer"] else 0
+                nll_vals.append(-np.log(mean_probs[j, true_idx].item() + 1e-12))
+    
+    # Clean up to free memory
+    del model
+    del base_model
+    torch.cuda.empty_cache()
 
     return {"nll": float(np.mean(nll_vals))}
 
