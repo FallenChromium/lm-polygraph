@@ -20,7 +20,7 @@ def run_reference_bayesian_peft(model_path, adapter_path, beta=0.01, n_samples=1
     cmd = [
         "python", "bayesian-peft/run/main.py",
         "--dataset-type", "mcdataset",
-        "--dataset", "pqa_labeled",
+        "--dataset", "boolq",
         "--model-type", "causallm",
         "--model", model_path, 
         "--modelwrapper", "tfblora_acc",
@@ -107,11 +107,9 @@ def run_candidate_lm_polygraph(model_path, adapter_path, beta=0.01, n_samples=10
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Dataset split consistent with reference (seed=42, 90/10)
-    dataset_full = load_dataset("qiaojin/PubMedQA", "pqa_labeled", split="train")
-    ds_split = dataset_full.train_test_split(test_size=0.1, seed=42)
-    anchor_ds = ds_split["train"].select(range(min(anchor_size, len(ds_split["train"]))))
-    eval_ds = ds_split["test"]
+    dataset_full = load_dataset("boolq")
+    anchor_ds = dataset_full["train"].select(range(min(anchor_size, len(ds_split["train"]))))
+    eval_ds = dataset_full["validation"]
 
     # Targets from tokenizer - NO leading space to match reference implementation
     labels = ["yes", "no", "maybe"]
@@ -293,10 +291,14 @@ Answer:"""
     return {"nll": float(np.mean(nll_vals))}
 
 def main():
-    # Use a small model for speed
-    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-    adapter_name = "ShahzebKhoso/qwen2.5-instruct-0.5B-pubmedqa-lora"
-    model_cache = "model_cache"
+    # Use a small LLaMA model - better supported by reference implementation
+    # Qwen has tokenizer/padding issues in the reference that are out of scope to fix
+    model_name = "unsloth/Llama-3.2-3B-Instruct"
+    adapter_name = "Speeeed/Llama-3.2-3B-instruct-boolq-lora"  # You may need to find/train a suitable adapter
+    
+    # Alternative: use a model that bayesian-peft was tested with
+    # model_name = "meta-llama/Llama-2-7b-hf"
+    # adapter_name = "<appropriate-lora-adapter>"
     
     # 1. Run Reference
     ref_metrics = run_reference_bayesian_peft(model_name, adapter_name)
