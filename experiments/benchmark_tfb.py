@@ -129,7 +129,6 @@ def run_candidate_lm_polygraph(model_path, adapter_path, beta=0.01, n_samples=10
 
     # Targets from tokenizer - Use "True"/"False" to match reference implementation
     labels = ["True", "False"]
-    label_map = {"yes": 0, "no": 1}
     target_ids = tokenizer(labels, add_special_tokens=False).input_ids
     target_ids = [ids[0] for ids in target_ids]
     target_ids_tensor = torch.tensor(target_ids, device=device)
@@ -148,15 +147,13 @@ Answer (true or false):"""
         else:
             return mask.sum(dim=1) - 1
 
-    from transformers import DataCollatorWithPadding
-    collator = DataCollatorWithPadding(tokenizer=tokenizer, padding="longest")
-
     # Apply TFB
     apply_tfb(model, beta=beta)
 
-    # Prepare calibration batches - FIXED to match original logic exactly
+    # Prepare calibration batches with larger batch size
     cal_batches = []
     baselines = []
+    cal_batch_size = 16  # Increased from 8
     
     print("Pre-computing Calibration Baselines (beta=0)...")
     update_tfb_beta(model, 0.0)  # Set beta=0 for deterministic baseline
@@ -165,23 +162,30 @@ Answer (true or false):"""
     # Collect ground truth labels alongside batches
     ground_truth_per_batch = []
     
+    # Pre-compute all calibration prompts
+    cal_prompts = [
+        preamble.format(context=e["passage"], question=e["question"])
+        for e in anchor_ds
+    ]
+    cal_labels = [0 if e["answer"] else 1 for e in anchor_ds]
+    
     with torch.no_grad():
-        for i in range(0, len(anchor_ds), 8):
-            chunk = anchor_ds.select(range(i, min(i + 8, len(anchor_ds))))
-            prompts = [
-                preamble.format(
-                    context=e["passage"],
-                    question=e["question"],
-                )
-                for e in chunk
-            ]
-            # Ground truth labels - map answer to class index
-            # labels = ["True", "False"], so True->0, False->1
-            gt_classes = torch.tensor([0 if e["answer"] else 1 for e in chunk], device=device)
+        for i in range(0, len(anchor_ds), cal_batch_size):
+            end_idx = min(i + cal_batch_size, len(anchor_ds))
+            prompts = cal_prompts[i:end_idx]
+            
+            # Ground truth labels for this batch
+            gt_classes = torch.tensor(cal_labels[i:end_idx], device=device)
             ground_truth_per_batch.append(gt_classes)
             
-            tokenized = [tokenizer(p, truncation=True, max_length=512) for p in prompts]
-            batch = collator(tokenized)
+            # Batched tokenization
+            batch = tokenizer(
+                prompts,
+                truncation=True,
+                max_length=512,
+                padding="longest",
+                return_tensors="pt"
+            )
             batch = {k: v.to(device) for k, v in batch.items()}
 
             logits = model(**batch).logits
@@ -284,23 +288,31 @@ Answer (true or false):"""
     update_tfb_beta(model, best_beta)
     enable_tfb_sampling(model)
 
-    # Process evaluation in batches for efficiency
+    # Process evaluation in batches - larger batch for better GPU utilization
     nll_vals = []
-    eval_batch_size = 8
+    eval_batch_size = 32  # Increased from 8 - 3090 can handle this easily with int8
+    
+    # Pre-compute all prompts and ground truth for vectorized processing
+    all_prompts = [
+        preamble.format(context=e["passage"], question=e["question"])
+        for e in eval_ds
+    ]
+    all_labels = torch.tensor([0 if e["answer"] else 1 for e in eval_ds], device=device)
     
     with torch.no_grad():
         for i in range(0, len(eval_ds), eval_batch_size):
-            chunk = eval_ds.select(range(i, min(i + eval_batch_size, len(eval_ds))))
-            prompts = [
-                preamble.format(
-                    context=e["passage"],
-                    question=e["question"],
-                )
-                for e in chunk
-            ]
+            end_idx = min(i + eval_batch_size, len(eval_ds))
+            prompts = all_prompts[i:end_idx]
+            batch_labels = all_labels[i:end_idx]
             
-            tokenized = [tokenizer(p, truncation=True, max_length=512) for p in prompts]
-            batch = collator(tokenized)
+            # Batched tokenization - much faster than per-item
+            batch = tokenizer(
+                prompts,
+                truncation=True,
+                max_length=512,
+                padding="longest",
+                return_tensors="pt"
+            )
             batch = {k: v.to(device) for k, v in batch.items()}
             
             # Collect samples
@@ -312,14 +324,11 @@ Answer (true or false):"""
                 logits = logits[b_idx, idx][:, target_ids_tensor]
                 batch_probs.append(torch.softmax(logits, dim=-1))
             
-            # BMA per sample
-            mean_probs = torch.stack(batch_probs).mean(dim=0)
-            
-            # Compute NLL for each item in batch
-            # labels = ["True", "False"], so True->0, False->1
-            for j, item in enumerate(chunk):
-                true_idx = 0 if item["answer"] else 1
-                nll_vals.append(-np.log(mean_probs[j, true_idx].item() + 1e-12))
+            # BMA - vectorized NLL computation
+            mean_probs = torch.stack(batch_probs).mean(dim=0)  # [batch, 2]
+            true_probs = mean_probs[torch.arange(len(batch_labels), device=device), batch_labels]
+            batch_nll = -torch.log(true_probs + 1e-12)
+            nll_vals.extend(batch_nll.cpu().tolist())
     
     # Clean up to free memory
     del model
