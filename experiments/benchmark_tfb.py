@@ -48,23 +48,36 @@ def run_reference_bayesian_peft(model_path, adapter_path, beta=0.01, n_samples=1
     
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd_path)
     
-    if result.returncode != 0:
-        print("Error running reference script:")
-        print("STDERR:", result.stderr)
-        print("STDOUT:", result.stdout)
-        return None
-    
     # Print the subprocess output for debugging
     print("=== REFERENCE SUBPROCESS OUTPUT ===")
     print(result.stdout)
     print("=== END SUBPROCESS OUTPUT ===")
     
-    # Instead of stdout, we MUST read the log file because we reverted the print changes in the lib.
-    log_file_path = os.path.join(cwd_path, "checkpoints", "tfblora_acc", model_path, "pqa_labeled", "default", "log.txt")
+    if result.returncode != 0:
+        print("Error running reference script:")
+        print("STDERR:", result.stderr)
+        return None
+    
+    # Check if stderr has any warnings/errors even if returncode is 0
+    if result.stderr:
+        print("=== SUBPROCESS STDERR ===")
+        print(result.stderr)
+        print("=== END STDERR ===")
+    
+    # The log file path should match the dataset name used in the reference
+    # Looking at the code: f'checkpoints/{modelwrapper}/{model}/{dataset}/{log_path}'
+    log_file_path = os.path.join(cwd_path, "checkpoints", "tfblora_acc", model_path, "boolq", "default", "log.txt")
     
     if not os.path.exists(log_file_path):
         print(f"Log file not found at {log_file_path}")
-        print("Subprocess Output:", result.stdout[-500:])
+        # Try to find any log files in the checkpoints directory
+        checkpoints_dir = os.path.join(cwd_path, "checkpoints")
+        if os.path.exists(checkpoints_dir):
+            print(f"\nSearching for log files in {checkpoints_dir}:")
+            for root, dirs, files in os.walk(checkpoints_dir):
+                for file in files:
+                    if file.endswith('.txt'):
+                        print(f"  Found: {os.path.join(root, file)}")
         return None
         
     with open(log_file_path, 'r') as f:
@@ -126,8 +139,14 @@ def run_candidate_lm_polygraph(model_path, adapter_path, beta=0.01, n_samples=10
 Question: {question}
 Answer (true or false):"""
 
-    def last_nonpad(mask: torch.Tensor) -> torch.Tensor:
-        return mask.sum(dim=1) - 1
+    def last_token_idx(mask: torch.Tensor) -> torch.Tensor:
+        """Get index of last real token. With left-padding, this is always seq_len - 1."""
+        # With left-padding, all real tokens are at the end, so last token is at seq_len - 1
+        # With right-padding, last real token is at mask.sum() - 1
+        if tokenizer.padding_side == "left":
+            return torch.full((mask.size(0),), mask.size(1) - 1, device=mask.device, dtype=torch.long)
+        else:
+            return mask.sum(dim=1) - 1
 
     from transformers import DataCollatorWithPadding
     collator = DataCollatorWithPadding(tokenizer=tokenizer, padding="longest")
@@ -156,8 +175,9 @@ Answer (true or false):"""
                 )
                 for e in chunk
             ]
-            # Ground truth labels - map answer to 0/1
-            gt_classes = torch.tensor([1 if e["answer"] else 0 for e in chunk], device=device)
+            # Ground truth labels - map answer to class index
+            # labels = ["True", "False"], so True->0, False->1
+            gt_classes = torch.tensor([0 if e["answer"] else 1 for e in chunk], device=device)
             ground_truth_per_batch.append(gt_classes)
             
             tokenized = [tokenizer(p, truncation=True, max_length=512) for p in prompts]
@@ -165,7 +185,7 @@ Answer (true or false):"""
             batch = {k: v.to(device) for k, v in batch.items()}
 
             logits = model(**batch).logits
-            idx = last_nonpad(batch["attention_mask"])
+            idx = last_token_idx(batch["attention_mask"])
             b_idx = torch.arange(logits.size(0), device=logits.device)
             logits = logits[b_idx, idx][:, target_ids_tensor]
             det_probs = torch.softmax(logits, dim=-1)
@@ -194,7 +214,7 @@ Answer (true or false):"""
     with torch.no_grad():
         test_batch = cal_batches[0]
         raw_logits = model(**test_batch).logits
-        idx = last_nonpad(test_batch["attention_mask"])
+        idx = last_token_idx(test_batch["attention_mask"])
         seq_len = test_batch["input_ids"].shape[1]
         print(f"  Sequence length: {seq_len}, last_token_idx[0]: {idx[0].item()}")
         print(f"  Attention mask[0] sum: {test_batch['attention_mask'][0].sum().item()}")
@@ -235,7 +255,7 @@ Answer (true or false):"""
         with torch.no_grad():
             for _ in range(n_s):
                 logits = m(**inputs).logits
-                idx = last_nonpad(inputs["attention_mask"])
+                idx = last_token_idx(inputs["attention_mask"])
                 b_idx = torch.arange(logits.size(0), device=logits.device)
                 logits = logits[b_idx, idx][:, target_ids_tensor]
                 probs = torch.softmax(logits, dim=-1)
@@ -287,7 +307,7 @@ Answer (true or false):"""
             batch_probs = []
             for _ in range(n_samples):
                 logits = model(**batch).logits
-                idx = last_nonpad(batch["attention_mask"])
+                idx = last_token_idx(batch["attention_mask"])
                 b_idx = torch.arange(logits.size(0), device=logits.device)
                 logits = logits[b_idx, idx][:, target_ids_tensor]
                 batch_probs.append(torch.softmax(logits, dim=-1))
@@ -296,8 +316,9 @@ Answer (true or false):"""
             mean_probs = torch.stack(batch_probs).mean(dim=0)
             
             # Compute NLL for each item in batch
+            # labels = ["True", "False"], so True->0, False->1
             for j, item in enumerate(chunk):
-                true_idx = 1 if item["answer"] else 0
+                true_idx = 0 if item["answer"] else 1
                 nll_vals.append(-np.log(mean_probs[j, true_idx].item() + 1e-12))
     
     # Clean up to free memory
