@@ -36,6 +36,7 @@ def run_reference_bayesian_peft(model_path, adapter_path, beta=0.01, n_samples=1
         "--anchor-size", "50", # calibration set size
         "--th", "0.01", # Target change ratio
         "--bayes-train-n-samples", "5", # Ensure sufficient resolution (1/250 = 0.4%)
+        "--add-space",  # Use [" True", " False"] tokens to match candidate
     ]
     
     print("Executing:", " ".join(cmd))
@@ -120,7 +121,7 @@ def run_candidate_lm_polygraph(model_path, adapter_path, beta=0.01, n_samples=10
     # Tokenizer setup matching S2SDataset_Classification.py lines 37-40
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     tokenizer.padding_side = "left"
-    tokenizer.add_eos_token = True  # For boolq specifically (line 39)
+    tokenizer.add_eos_token = True
     tokenizer.pad_token = tokenizer.bos_token  # line 40
 
     # Load dataset: load_dataset("boolq") via dsets.BoolQDataset (line 159)
