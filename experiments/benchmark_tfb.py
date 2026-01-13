@@ -104,12 +104,12 @@ def run_reference_bayesian_peft(model_path, adapter_path, beta=0.01, n_samples=1
     return {"nll": nll, "acc": acc}
 
 def run_candidate_lm_polygraph(model_path, adapter_path, beta=0.01, n_samples=10, anchor_size=50):
-    """Runs lm-polygraph implementation in-process with tokenizer-agnostic last-token selection."""
+    """Runs lm-polygraph implementation matching reference EXACTLY."""
     print(f"\n--- [Candidate] Running LM-Polygraph (beta={beta}, n_samples={n_samples}) ---")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Load Model with 8-bit quantization to match reference memory usage
+    # Load Model with 8-bit quantization to match reference
     base_model = AutoModelForCausalLM.from_pretrained(
         model_path,
         load_in_8bit=True,
@@ -117,31 +117,33 @@ def run_candidate_lm_polygraph(model_path, adapter_path, beta=0.01, n_samples=10
     )
     model = PeftModel.from_pretrained(base_model, adapter_path)
 
-    # Tokenizer aligned with reference defaults, but selection is last-nonpad (Qwen might have issues with left-padding inference though)
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    # Tokenizer setup matching S2SDataset_Classification.py lines 37-40
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     tokenizer.padding_side = "left"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.add_eos_token = True  # For boolq specifically (line 39)
+    tokenizer.pad_token = tokenizer.bos_token  # line 40
 
+    # Load dataset: load_dataset("boolq") via dsets.BoolQDataset (line 159)
     dataset_full = load_dataset("boolq")
     anchor_ds = dataset_full["train"].select(range(min(anchor_size, len(dataset_full["train"]))))
     eval_ds = dataset_full["validation"]
 
-    # Targets from tokenizer - Use "True"/"False" to match reference implementation
-    labels = ["True", "False"]
-    target_ids = tokenizer(labels, add_special_tokens=False).input_ids
-    target_ids = [ids[0] for ids in target_ids]
+    # Target IDs matching dsets.py lines 72-76
+    # add_space=True is default for BoolQDataset (line 162)
+    labels = [" True", " False"]
+    target_ids = tokenizer(labels, add_special_tokens=False, return_tensors="pt").input_ids[:, -1:]
+    target_ids = target_ids.squeeze(-1).tolist()
     target_ids_tensor = torch.tensor(target_ids, device=device)
 
-    # Match reference prompt format exactly
-    preamble = """Context: {context}
+    # Prompt from dsets.py BoolQDataset lines 166-170
+    preamble = """Read the passage below and answer the question with the words 'true' or 'false'.
+
+Passage: {passage}
 Question: {question}
 Answer (true or false):"""
 
     def last_token_idx(mask: torch.Tensor) -> torch.Tensor:
         """Get index of last real token. With left-padding, this is always seq_len - 1."""
-        # With left-padding, all real tokens are at the end, so last token is at seq_len - 1
-        # With right-padding, last real token is at mask.sum() - 1
         if tokenizer.padding_side == "left":
             return torch.full((mask.size(0),), mask.size(1) - 1, device=mask.device, dtype=torch.long)
         else:
@@ -162,11 +164,16 @@ Answer (true or false):"""
     # Collect ground truth labels alongside batches
     ground_truth_per_batch = []
     
-    # Pre-compute all calibration prompts
+    # Pre-compute all calibration prompts matching dsets.py BoolQDataset.clm_collate_fn line 177
+    # Note: passage is truncated to 1024 chars in reference
     cal_prompts = [
-        preamble.format(context=e["passage"], question=e["question"])
+        preamble.format(passage=e["passage"][:1024], question=e["question"])
         for e in anchor_ds
     ]
+    # BoolQDataset uses int(e["answer"]) for classes (line 179)
+    # answer is boolean: True->1, False->0
+    # labels are [" True", " False"], so True->0, False->1
+    # Therefore: answer=True -> class 0, answer=False -> class 1
     cal_labels = [0 if e["answer"] else 1 for e in anchor_ds]
     
     with torch.no_grad():
@@ -178,13 +185,13 @@ Answer (true or false):"""
             gt_classes = torch.tensor(cal_labels[i:end_idx], device=device)
             ground_truth_per_batch.append(gt_classes)
             
-            # Batched tokenization
+            # Batched tokenization matching dsets.py _tokenize_prompts (lines 138-143)
             batch = tokenizer(
                 prompts,
+                padding=True,
                 truncation=True,
+                return_tensors="pt",
                 max_length=512,
-                padding="longest",
-                return_tensors="pt"
             )
             batch = {k: v.to(device) for k, v in batch.items()}
 
@@ -198,9 +205,11 @@ Answer (true or false):"""
             cal_batches.append(batch)
             baselines.append(det_preds)
 
-    # Debug: print target IDs and baseline predictions
     print(f"DEBUG [Candidate] target_ids: {target_ids} (tokens: {[tokenizer.decode([t]) for t in target_ids]})")
-    print(f"DEBUG [Candidate] pad_token_id: {tokenizer.pad_token_id}, eos_token_id: {tokenizer.eos_token_id}")
+    print(f"DEBUG [Candidate] pad_token: {tokenizer.pad_token} (id: {tokenizer.pad_token_id})")
+    print(f"DEBUG [Candidate] bos_token: {tokenizer.bos_token} (id: {tokenizer.bos_token_id})")
+    print(f"DEBUG [Candidate] eos_token: {tokenizer.eos_token} (id: {tokenizer.eos_token_id})")
+    print(f"DEBUG [Candidate] add_eos_token: {tokenizer.add_eos_token}")
     
     all_baseline_preds = torch.cat(baselines, dim=0)
     all_ground_truth = torch.cat(ground_truth_per_batch, dim=0)
@@ -292,9 +301,9 @@ Answer (true or false):"""
     nll_vals = []
     eval_batch_size = 32  # Increased from 8 - 3090 can handle this easily with int8
     
-    # Pre-compute all prompts and ground truth for vectorized processing
+    # Pre-compute all prompts and ground truth (with passage truncation)
     all_prompts = [
-        preamble.format(context=e["passage"], question=e["question"])
+        preamble.format(passage=e["passage"][:1024], question=e["question"])
         for e in eval_ds
     ]
     all_labels = torch.tensor([0 if e["answer"] else 1 for e in eval_ds], device=device)
@@ -305,13 +314,13 @@ Answer (true or false):"""
             prompts = all_prompts[i:end_idx]
             batch_labels = all_labels[i:end_idx]
             
-            # Batched tokenization - much faster than per-item
+            # Batched tokenization matching reference
             batch = tokenizer(
                 prompts,
+                padding=True,
                 truncation=True,
+                return_tensors="pt",
                 max_length=512,
-                padding="longest",
-                return_tensors="pt"
             )
             batch = {k: v.to(device) for k, v in batch.items()}
             
