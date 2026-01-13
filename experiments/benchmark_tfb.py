@@ -144,11 +144,11 @@ Question: {question}
 Answer (true or false):"""
 
     def last_token_idx(mask: torch.Tensor) -> torch.Tensor:
-        """Get index of last real token. With left-padding, this is always seq_len - 1."""
-        if tokenizer.padding_side == "left":
-            return torch.full((mask.size(0),), mask.size(1) - 1, device=mask.device, dtype=torch.long)
-        else:
-            return mask.sum(dim=1) - 1
+        """Get index of last real token - matching reference implementation exactly."""
+        # Reference: seq_len - 1 - attention_mask.flip(dims=[1]).argmax(dim=1)
+        # This finds the position of the last 1 in the attention mask
+        seq_len = mask.size(1)
+        return seq_len - 1 - mask.flip(dims=[1]).argmax(dim=1)
 
     # Apply TFB
     apply_tfb(model, beta=beta)
