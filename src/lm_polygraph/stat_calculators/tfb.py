@@ -273,6 +273,14 @@ class TFBStatCalculator(StatCalculator):
 
         return np.mean(nlls)
 
+    def _chunked_generate_texts(self, model, texts, max_new_tokens):
+        results = []
+        bs = self.batch_size if self.batch_size > 0 else 4
+        for i in range(0, len(texts), bs):
+            batch = texts[i : i + bs]
+            results.extend(model.generate_texts(batch, max_new_tokens=max_new_tokens))
+        return results
+
     def _metric_exact_match(self, model, inputs, targets) -> float:
         """Helper to calculate mismatch rate (Flip Rate)."""
         mismatches = 0
@@ -283,16 +291,13 @@ class TFBStatCalculator(StatCalculator):
                 inputs,
                 max_new_tokens=50,  # TODO: is there a counterexample for this optimization?
             )
-
             for gen, target in zip(generated_texts, targets):
-                # Basic exact match comparison
-                # Can be improved with more robust logic (e.g. token overlap)
                 if gen.strip() != target.strip():
                     mismatches += 1
                 total += 1
         except Exception as e:
             log.warning(f"TFB Eval Error (exact_match): {e}")
-            return 1.0  # Max error
+            return 1.0 # Max error
 
         return mismatches / total if total > 0 else 0.0
 
@@ -316,20 +321,20 @@ class TFBStatCalculator(StatCalculator):
 
         # 1. Baseline (Deterministic)
         set_tfb_mode(hf_model, False)
-        # If user provided anchor_targets, use them.
-        # Otherwise, generate them using the clean model (Self-Consistency).
+
+        # Determine targets for calibration
         if self.anchor_targets:
             calibration_targets = self.anchor_targets
         else:
             log.info("TFB: Generating baseline targets for calibration...")
-            calibration_targets = model.generate_texts(
-                self.anchor_inputs, max_new_tokens=50
+            calibration_targets = self._chunked_generate_texts(
+                model, self.anchor_inputs, max_new_tokens=20
             )
 
         if self.calibration_mode == "seq_nll":
-            baseline_val = metric_fn(model, self.anchor_inputs, calibration_targets)
+             baseline_val = metric_fn(model, self.anchor_inputs, calibration_targets)
         else:
-            baseline_val = 0.0
+             baseline_val = 0.0 
 
         log.info(f"TFB: Baseline Metric ({self.calibration_mode}) = {baseline_val:.4f}")
 
