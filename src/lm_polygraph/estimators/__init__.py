@@ -90,4 +90,4 @@ from .cocoa import CocoaMSP, CocoaPPL, CocoaMTE
 from .rauq import RAUQ
 from .csl import CSL
 from .semantic_density import SemanticDensity
-from .tfb import TFBEstimator
+from .tfb import TFBSequenceEstimator, TFBTokenEstimator
