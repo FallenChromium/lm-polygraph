@@ -386,102 +386,142 @@ class TFBStatCalculator(StatCalculator):
             set_tfb_mode(model.model, True)
 
             bs = self.batch_size if self.batch_size > 0 else 1
-
-            for i in range(0, len(texts), bs):
-                chunk_texts = texts[i : i + bs]
-
-                # Expand
-                expanded_texts = []
-                for t in chunk_texts:
-                    expanded_texts.extend([t] * self.n_samples)
-
-                batch_tokens = model.tokenize(expanded_texts)
-                batch_tokens = {
-                    k: v.to(model.device()) for k, v in batch_tokens.items()
-                }
-
-                with torch.no_grad():
-                    out = model.generate(
-                        **batch_tokens,
-                        output_scores=True,
-                        return_dict_in_generate=True,
-                        max_new_tokens=max_new_tokens,
-                        min_new_tokens=2,
-                        num_return_sequences=1,
-                    )
-
-                sequences = out.sequences
-                scores = torch.stack(out.scores, dim=1) if out.scores else None
-
-                if model.model_type == "CausalLM":
-                    input_len = batch_tokens["input_ids"].shape[1]
-                    gen_sequences = sequences[:, input_len:]
-                elif model.model_type == "Seq2SeqLM":
-                    gen_sequences = sequences[:, 1:]
-                else:
-                    input_len = batch_tokens["input_ids"].shape[1]
-                    gen_sequences = sequences[:, input_len:]
-
-                cpu_seqs = gen_sequences.cpu().tolist()
-                cpu_scores = scores.cpu() if scores is not None else None
-
-                # Process chunk results
-                for k in range(len(chunk_texts)):
-                    start = k * self.n_samples
-                    end = start + self.n_samples
-
-                    sample_texts = []
-                    sample_log_probs = []
-                    sample_tokens = []
-                    sample_target_probs = []
-
-                    for j in range(start, end):
-                        seq = cpu_seqs[j]
-                        if model.tokenizer.eos_token_id in seq:
-                            eos_idx = seq.index(model.tokenizer.eos_token_id)
-                            seq = seq[:eos_idx]
-                        text = model.tokenizer.decode(seq)
-
-                        if cpu_scores is not None:
-                            slen = min(len(seq), cpu_scores.shape[1])
-                            current_scores = cpu_scores[j, :slen, :]
-                            current_log_probs = torch.log_softmax(
-                                current_scores, dim=-1
-                            )
-
-                            token_ids = torch.tensor(seq[:slen]).unsqueeze(-1)
-                            token_log_probs = torch.gather(
-                                current_log_probs, -1, token_ids
-                            ).squeeze(-1)
-                            sample_log_probs.append(token_log_probs.tolist())
-                            
-                            # --- Target Probabilities Logic ---
-                            if self.target_ids is not None:
-                                # Extract logits for target tokens from first generated position
-                                first_token_logits = current_scores[0, :]  # [vocab]
-                                target_logits = first_token_logits[self.target_ids]
-                                target_probs = torch.softmax(target_logits, dim=-1)
-                                sample_target_probs.append(target_probs.tolist())
-                        else:
-                            sample_log_probs.append([])
-                            if self.target_ids is not None:
-                                sample_target_probs.append([])
-
-                        sample_texts.append(text)
-                        sample_tokens.append(seq)
-
-                    all_res_texts.append(sample_texts)
-                    all_res_log_probs.append(sample_log_probs)
-                    all_res_tokens.append(sample_tokens)
-                    if self.target_ids is not None:
+            
+            # Classification mode: use forward pass at last input position
+            if self.target_ids is not None:
+                target_ids_tensor = torch.tensor(self.target_ids, device=model.device())
+                
+                for i in range(0, len(texts), bs):
+                    chunk_texts = texts[i : i + bs]
+                    
+                    for text in chunk_texts:
+                        # Tokenize once per input
+                        batch_tokens = model.tokenize([text])
+                        batch_tokens = {
+                            k: v.to(model.device()) for k, v in batch_tokens.items()
+                        }
+                        
+                        sample_texts = []
+                        sample_log_probs = []
+                        sample_target_probs = []
+                        
+                        # Multiple forward passes for TFB samples
+                        with torch.no_grad():
+                            for _ in range(self.n_samples):
+                                # Forward pass (no generation)
+                                logits = model.model(**batch_tokens).logits  # [1, seq_len, vocab]
+                                
+                                # Get last input token position
+                                attention_mask = batch_tokens["attention_mask"][0]
+                                last_idx = attention_mask.sum() - 1
+                                
+                                # Extract logits at last position for target tokens
+                                last_logits = logits[0, last_idx, target_ids_tensor]
+                                probs = torch.softmax(last_logits, dim=-1)
+                                log_probs = torch.log_softmax(last_logits, dim=-1)
+                                
+                                sample_target_probs.append(probs.cpu().tolist())
+                                sample_log_probs.append(log_probs.cpu().tolist())
+                                
+                                # Decode the predicted token for consistency
+                                pred_idx = probs.argmax().item()
+                                pred_token_id = self.target_ids[pred_idx]
+                                pred_text = model.tokenizer.decode([pred_token_id])
+                                sample_texts.append(pred_text)
+                        
+                        all_res_texts.append(sample_texts)
+                        all_res_log_probs.append(sample_log_probs)
+                        all_res_tokens.append([[] for _ in range(self.n_samples)])
                         all_res_target_probs.append(sample_target_probs)
+                        
+                        # Clean up
+                        del batch_tokens
+                        torch.cuda.empty_cache()
+            
+            # Generation mode: use model.generate()
+            else:
+                for i in range(0, len(texts), bs):
+                    chunk_texts = texts[i : i + bs]
 
-                # Clean up chunk memory
-                del out
-                del scores
-                del cpu_scores
-                del batch_tokens
-                torch.cuda.empty_cache()
+                    # Expand
+                    expanded_texts = []
+                    for t in chunk_texts:
+                        expanded_texts.extend([t] * self.n_samples)
+
+                    batch_tokens = model.tokenize(expanded_texts)
+                    batch_tokens = {
+                        k: v.to(model.device()) for k, v in batch_tokens.items()
+                    }
+
+                    with torch.no_grad():
+                        out = model.generate(
+                            **batch_tokens,
+                            output_scores=True,
+                            return_dict_in_generate=True,
+                            max_new_tokens=max_new_tokens,
+                            min_new_tokens=2,
+                            num_return_sequences=1,
+                        )
+
+                    sequences = out.sequences
+                    scores = torch.stack(out.scores, dim=1) if out.scores else None
+
+                    if model.model_type == "CausalLM":
+                        input_len = batch_tokens["input_ids"].shape[1]
+                        gen_sequences = sequences[:, input_len:]
+                    elif model.model_type == "Seq2SeqLM":
+                        gen_sequences = sequences[:, 1:]
+                    else:
+                        input_len = batch_tokens["input_ids"].shape[1]
+                        gen_sequences = sequences[:, input_len:]
+
+                    cpu_seqs = gen_sequences.cpu().tolist()
+                    cpu_scores = scores.cpu() if scores is not None else None
+
+                    # Process chunk results
+                    for k in range(len(chunk_texts)):
+                        start = k * self.n_samples
+                        end = start + self.n_samples
+
+                        sample_texts = []
+                        sample_log_probs = []
+                        sample_tokens = []
+
+                        for j in range(start, end):
+                            seq = cpu_seqs[j]
+                            if model.tokenizer.eos_token_id in seq:
+                                eos_idx = seq.index(model.tokenizer.eos_token_id)
+                                seq = seq[:eos_idx]
+                            text = model.tokenizer.decode(seq)
+
+                            if cpu_scores is not None:
+                                slen = min(len(seq), cpu_scores.shape[1])
+                                current_scores = cpu_scores[j, :slen, :]
+                                current_log_probs = torch.log_softmax(
+                                    current_scores, dim=-1
+                                )
+
+                                token_ids = torch.tensor(seq[:slen]).unsqueeze(-1)
+                                token_log_probs = torch.gather(
+                                    current_log_probs, -1, token_ids
+                                ).squeeze(-1)
+                                sample_log_probs.append(token_log_probs.tolist())
+                            else:
+                                sample_log_probs.append([])
+
+                            sample_texts.append(text)
+                            sample_tokens.append(seq)
+
+                        all_res_texts.append(sample_texts)
+                        all_res_log_probs.append(sample_log_probs)
+                        all_res_tokens.append(sample_tokens)
+
+                    # Clean up chunk memory
+                    del out
+                    del scores
+                    del cpu_scores
+                    del batch_tokens
+                    torch.cuda.empty_cache()
 
         finally:
             set_tfb_mode(model.model, False)
