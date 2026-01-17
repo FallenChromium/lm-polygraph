@@ -207,6 +207,10 @@ def set_tfb_mode(model: nn.Module, enabled: bool):
 
 
 class TFBStatCalculator(StatCalculator):
+    @staticmethod
+    def meta_info() -> tuple[list[str], list[str]]:
+        return (["tfb_texts", "tfb_log_probs", "tfb_tokens"], [])
+
     def __init__(
         self,
         stats_key: str,
@@ -222,14 +226,7 @@ class TFBStatCalculator(StatCalculator):
         calibration_mode: Literal["seq_nll", "exact_match"] = "seq_nll",
     ):
         self.stats_key = stats_key
-        super().__init__(
-            stats=[
-                f"{self.stats_key}_texts",
-                f"{self.stats_key}_log_probs",
-                f"{self.stats_key}_tokens",
-            ],
-            stats_dependencies=[],
-        )
+        super().__init__()
 
         self.anchor_inputs = anchor_inputs or []
         self.anchor_targets = anchor_targets or []
@@ -243,7 +240,7 @@ class TFBStatCalculator(StatCalculator):
         self.calibration_mode = calibration_mode
 
         # State
-        self._is_calibrated = self.beta is None
+        self._is_calibrated = self.beta is not None
         # Store comparison baseline if needed
         self._calibration_baseline = None
 
@@ -287,9 +284,10 @@ class TFBStatCalculator(StatCalculator):
         total = 0
 
         try:
-            generated_texts = model.generate_texts(
+            generated_texts = self._chunked_generate_texts(
+                model,
                 inputs,
-                max_new_tokens=50,  # TODO: is there a counterexample for this optimization?
+                max_new_tokens=10,
             )
             for gen, target in zip(generated_texts, targets):
                 if gen.strip() != target.strip():
@@ -297,7 +295,7 @@ class TFBStatCalculator(StatCalculator):
                 total += 1
         except Exception as e:
             log.warning(f"TFB Eval Error (exact_match): {e}")
-            return 1.0 # Max error
+            return 1.0  # Max error
 
         return mismatches / total if total > 0 else 0.0
 
@@ -332,9 +330,9 @@ class TFBStatCalculator(StatCalculator):
             )
 
         if self.calibration_mode == "seq_nll":
-             baseline_val = metric_fn(model, self.anchor_inputs, calibration_targets)
+            baseline_val = metric_fn(model, self.anchor_inputs, calibration_targets)
         else:
-             baseline_val = 0.0 
+            baseline_val = 0.0
 
         log.info(f"TFB: Baseline Metric ({self.calibration_mode}) = {baseline_val:.4f}")
 
@@ -379,86 +377,105 @@ class TFBStatCalculator(StatCalculator):
         else:
             current_beta = self.beta
 
+        # Result containers
+        all_res_texts = []
+        all_res_log_probs = []
+        all_res_tokens = []
+
         try:
             update_tfb_beta(model.model, current_beta)
             set_tfb_mode(model.model, True)
 
-            expanded_texts = []
-            for t in texts:
-                expanded_texts.extend([t] * self.n_samples)
+            bs = self.batch_size if self.batch_size > 0 else 1
 
-            batch_tokens = model.tokenize(expanded_texts)
-            batch_tokens = {k: v.to(model.device()) for k, v in batch_tokens.items()}
+            for i in range(0, len(texts), bs):
+                chunk_texts = texts[i : i + bs]
 
-            with torch.no_grad():
-                out = model.generate(
-                    **batch_tokens,
-                    output_scores=True,
-                    return_dict_in_generate=True,
-                    max_new_tokens=max_new_tokens,
-                    min_new_tokens=2,
-                    num_return_sequences=1,
-                )
+                # Expand
+                expanded_texts = []
+                for t in chunk_texts:
+                    expanded_texts.extend([t] * self.n_samples)
 
-            sequences = out.sequences
-            scores = torch.stack(out.scores, dim=1) if out.scores else None
+                batch_tokens = model.tokenize(expanded_texts)
+                batch_tokens = {
+                    k: v.to(model.device()) for k, v in batch_tokens.items()
+                }
 
-            if model.model_type == "CausalLM":
-                input_len = batch_tokens["input_ids"].shape[1]
-                gen_sequences = sequences[:, input_len:]
-            elif model.model_type == "Seq2SeqLM":
-                gen_sequences = sequences[:, 1:]
-            else:
-                input_len = batch_tokens["input_ids"].shape[1]
-                gen_sequences = sequences[:, input_len:]
+                with torch.no_grad():
+                    out = model.generate(
+                        **batch_tokens,
+                        output_scores=True,
+                        return_dict_in_generate=True,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=2,
+                        num_return_sequences=1,
+                    )
 
-            res_texts = []
-            res_log_probs = []
-            res_tokens = []
+                sequences = out.sequences
+                scores = torch.stack(out.scores, dim=1) if out.scores else None
 
-            cpu_seqs = gen_sequences.cpu().tolist()
-            cpu_scores = scores.cpu() if scores is not None else None
+                if model.model_type == "CausalLM":
+                    input_len = batch_tokens["input_ids"].shape[1]
+                    gen_sequences = sequences[:, input_len:]
+                elif model.model_type == "Seq2SeqLM":
+                    gen_sequences = sequences[:, 1:]
+                else:
+                    input_len = batch_tokens["input_ids"].shape[1]
+                    gen_sequences = sequences[:, input_len:]
 
-            for i in range(len(texts)):
-                start = i * self.n_samples
-                end = start + self.n_samples
+                cpu_seqs = gen_sequences.cpu().tolist()
+                cpu_scores = scores.cpu() if scores is not None else None
 
-                sample_texts = []
-                sample_log_probs = []
-                sample_tokens = []
+                # Process chunk results
+                for k in range(len(chunk_texts)):
+                    start = k * self.n_samples
+                    end = start + self.n_samples
 
-                for j in range(start, end):
-                    seq = cpu_seqs[j]
-                    if model.tokenizer.eos_token_id in seq:
-                        eos_idx = seq.index(model.tokenizer.eos_token_id)
-                        seq = seq[:eos_idx]
-                    text = model.tokenizer.decode(seq)
+                    sample_texts = []
+                    sample_log_probs = []
+                    sample_tokens = []
 
-                    if cpu_scores is not None:
-                        slen = min(len(seq), cpu_scores.shape[1])
-                        current_scores = cpu_scores[j, :slen, :]
-                        current_log_probs = torch.log_softmax(current_scores, dim=-1)
+                    for j in range(start, end):
+                        seq = cpu_seqs[j]
+                        if model.tokenizer.eos_token_id in seq:
+                            eos_idx = seq.index(model.tokenizer.eos_token_id)
+                            seq = seq[:eos_idx]
+                        text = model.tokenizer.decode(seq)
 
-                        token_ids = torch.tensor(seq[:slen]).unsqueeze(-1)
-                        token_log_probs = torch.gather(
-                            current_log_probs, -1, token_ids
-                        ).squeeze(-1)
-                        sample_log_probs.append(token_log_probs.tolist())
-                    else:
-                        sample_log_probs.append([])
+                        if cpu_scores is not None:
+                            slen = min(len(seq), cpu_scores.shape[1])
+                            current_scores = cpu_scores[j, :slen, :]
+                            current_log_probs = torch.log_softmax(
+                                current_scores, dim=-1
+                            )
 
-                    sample_texts.append(text)
-                    sample_tokens.append(seq)
+                            token_ids = torch.tensor(seq[:slen]).unsqueeze(-1)
+                            token_log_probs = torch.gather(
+                                current_log_probs, -1, token_ids
+                            ).squeeze(-1)
+                            sample_log_probs.append(token_log_probs.tolist())
+                        else:
+                            sample_log_probs.append([])
 
-                res_texts.append(sample_texts)
-                res_log_probs.append(sample_log_probs)
-                res_tokens.append(sample_tokens)
+                        sample_texts.append(text)
+                        sample_tokens.append(seq)
+
+                    all_res_texts.append(sample_texts)
+                    all_res_log_probs.append(sample_log_probs)
+                    all_res_tokens.append(sample_tokens)
+
+                # Clean up chunk memory
+                del out
+                del scores
+                del cpu_scores
+                del batch_tokens
+                torch.cuda.empty_cache()
 
         finally:
             set_tfb_mode(model.model, False)
 
         return {
-            f"{self.stats_key}_texts": res_texts,
-            f"{self.stats_key}_log_probs": res_log_probs,
-            f"{self.stats_key}_tokens": res_tokens,
+            f"{self.stats_key}_texts": all_res_texts,
+            f"{self.stats_key}_log_probs": all_res_log_probs,
+            f"{self.stats_key}_tokens": all_res_tokens,
         }
