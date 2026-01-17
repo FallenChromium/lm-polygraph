@@ -1,12 +1,8 @@
-import hashlib
-import json
-import logging
-import os
 from typing import Literal
+import logging
 
 import numpy as np
 import torch
-from pyarrow import set_cpu_count
 from torch import nn
 
 from lm_polygraph.stat_calculators.stat_calculator import StatCalculator
@@ -209,13 +205,14 @@ def set_tfb_mode(model: nn.Module, enabled: bool):
 class TFBStatCalculator(StatCalculator):
     @staticmethod
     def meta_info() -> tuple[list[str], list[str]]:
-        return (["tfb_texts", "tfb_log_probs", "tfb_tokens"], [])
+        return (["tfb_texts", "tfb_log_probs", "tfb_tokens", "tfb_target_probs"], [])
 
     def __init__(
         self,
         stats_key: str,
         anchor_inputs: list[str] = None,
         anchor_targets: list[str] = None,
+        target_ids: list[int] = None,
         n_samples: int = 5,
         target_epsilon: float = 0.003,
         beta: float | None = None,
@@ -230,6 +227,7 @@ class TFBStatCalculator(StatCalculator):
 
         self.anchor_inputs = anchor_inputs or []
         self.anchor_targets = anchor_targets or []
+        self.target_ids = target_ids
         self.n_samples = n_samples
         self.epsilon = target_epsilon
         self.beta = beta
@@ -381,6 +379,7 @@ class TFBStatCalculator(StatCalculator):
         all_res_texts = []
         all_res_log_probs = []
         all_res_tokens = []
+        all_res_target_probs = []
 
         try:
             update_tfb_beta(model.model, current_beta)
@@ -434,6 +433,7 @@ class TFBStatCalculator(StatCalculator):
                     sample_texts = []
                     sample_log_probs = []
                     sample_tokens = []
+                    sample_target_probs = []
 
                     for j in range(start, end):
                         seq = cpu_seqs[j]
@@ -454,8 +454,18 @@ class TFBStatCalculator(StatCalculator):
                                 current_log_probs, -1, token_ids
                             ).squeeze(-1)
                             sample_log_probs.append(token_log_probs.tolist())
+                            
+                            # --- Target Probabilities Logic ---
+                            if self.target_ids is not None:
+                                # Extract logits for target tokens from first generated position
+                                first_token_logits = current_scores[0, :]  # [vocab]
+                                target_logits = first_token_logits[self.target_ids]
+                                target_probs = torch.softmax(target_logits, dim=-1)
+                                sample_target_probs.append(target_probs.tolist())
                         else:
                             sample_log_probs.append([])
+                            if self.target_ids is not None:
+                                sample_target_probs.append([])
 
                         sample_texts.append(text)
                         sample_tokens.append(seq)
@@ -463,6 +473,8 @@ class TFBStatCalculator(StatCalculator):
                     all_res_texts.append(sample_texts)
                     all_res_log_probs.append(sample_log_probs)
                     all_res_tokens.append(sample_tokens)
+                    if self.target_ids is not None:
+                        all_res_target_probs.append(sample_target_probs)
 
                 # Clean up chunk memory
                 del out
@@ -478,4 +490,5 @@ class TFBStatCalculator(StatCalculator):
             f"{self.stats_key}_texts": all_res_texts,
             f"{self.stats_key}_log_probs": all_res_log_probs,
             f"{self.stats_key}_tokens": all_res_tokens,
+            f"{self.stats_key}_target_probs": all_res_target_probs,
         }
