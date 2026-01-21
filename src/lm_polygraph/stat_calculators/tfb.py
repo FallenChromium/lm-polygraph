@@ -1,5 +1,5 @@
-from typing import Literal
 import logging
+from typing import Literal, Sequence
 
 import numpy as np
 import torch
@@ -205,14 +205,23 @@ def set_tfb_mode(model: nn.Module, enabled: bool):
 class TFBStatCalculator(StatCalculator):
     @staticmethod
     def meta_info() -> tuple[list[str], list[str]]:
-        return (["tfb_texts", "tfb_log_probs", "tfb_tokens", "tfb_target_probs"], [])
+        return (
+            [
+                "tfb_texts",
+                "tfb_log_probs",
+                "tfb_tokens",
+                "tfb_target_probs",
+                "tfb_metadata",
+            ],
+            [],
+        )
 
     def __init__(
         self,
         stats_key: str,
         anchor_inputs: list[str] = None,
         anchor_targets: list[str] = None,
-        target_ids: list[int] = None,
+        target_ids: Sequence[int] | Sequence[Sequence[int]] | None = None,
         n_samples: int = 5,
         target_epsilon: float = 0.003,
         beta: float | None = None,
@@ -228,6 +237,8 @@ class TFBStatCalculator(StatCalculator):
         self.anchor_inputs = anchor_inputs or []
         self.anchor_targets = anchor_targets or []
         self.target_ids = target_ids
+        self._target_token_indices: list[torch.Tensor] | None = None
+        self._class_primary_tokens: list[int] = []
         self.n_samples = n_samples
         self.epsilon = target_epsilon
         self.beta = beta
@@ -241,6 +252,9 @@ class TFBStatCalculator(StatCalculator):
         self._is_calibrated = self.beta is not None
         # Store comparison baseline if needed
         self._calibration_baseline = None
+        self._calibration_summary: dict = {}
+        if self.target_ids is not None:
+            self._configure_target_ids(self.target_ids)
 
     def _metric_seq_nll(self, model, inputs, targets) -> float:
         """Helper to calculate NLL for the anchor set (Self-Consistency)."""
@@ -305,6 +319,78 @@ class TFBStatCalculator(StatCalculator):
         else:
             raise ValueError(f"Unknown calibration mode: {self.calibration_mode}")
 
+    def _configure_target_ids(self, target_ids: Sequence):
+        if not target_ids:
+            raise ValueError("target_ids must not be empty when provided.")
+        first = target_ids[0]
+        normalized: list[list[int]] = []
+
+        if isinstance(first, int):
+            seen = set()
+            for tid in target_ids:
+                tid_int = int(tid)
+                if tid_int not in seen:
+                    seen.add(tid_int)
+                    normalized.append([tid_int])
+        else:
+            for group in target_ids:
+                if not isinstance(group, Sequence) or len(group) == 0:
+                    raise ValueError(
+                        "Each target_id group must be a non-empty sequence."
+                    )
+                seen = set()
+                deduped: list[int] = []
+                for tid in group:
+                    tid_int = int(tid)
+                    if tid_int not in seen:
+                        seen.add(tid_int)
+                        deduped.append(tid_int)
+                if not deduped:
+                    raise ValueError(
+                        "Each target_id group must contain at least one unique token id."
+                    )
+                normalized.append(deduped)
+
+        self._target_token_indices = [
+            torch.tensor(group, dtype=torch.long) for group in normalized
+        ]
+        if not self._target_token_indices:
+            raise ValueError("target_ids must contain at least one token id.")
+        self._class_primary_tokens = [group[0] for group in normalized]
+
+    def _get_last_token_indices(self, attention_mask: torch.Tensor) -> torch.Tensor:
+        seq_len = attention_mask.size(1)
+        return (seq_len - 1 - attention_mask.flip(dims=[1]).argmax(dim=1)).long()
+
+    def _compute_class_probs(
+        self, logits: torch.Tensor, attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        if not self._target_token_indices:
+            raise ValueError("target_ids must be configured for classification mode.")
+        last_indices = self._get_last_token_indices(attention_mask)
+        batch_idx = torch.arange(logits.size(0), device=logits.device)
+        last_logits = logits[batch_idx, last_indices]
+        token_log_probs = torch.log_softmax(last_logits, dim=-1)
+        class_probs = []
+        for idx_tensor in self._target_token_indices:
+            idx = idx_tensor.to(token_log_probs.device)
+            class_probs.append(
+                torch.index_select(token_log_probs, dim=-1, index=idx).exp().sum(dim=-1)
+            )
+        class_probs_tensor = torch.stack(class_probs, dim=-1)
+        class_probs_tensor = class_probs_tensor / torch.clamp(
+            class_probs_tensor.sum(dim=-1, keepdim=True), min=1e-12
+        )
+        return class_probs_tensor
+
+    def _build_metadata(self) -> dict:
+        return {
+            "beta": self.beta,
+            "calibration": self._calibration_summary,
+            "n_samples": self.n_samples,
+            "mode": "classification" if self.target_ids is not None else "generation",
+        }
+
     def _binary_search(self, model: WhiteboxModel) -> float:
         """Performs the TFB calibration."""
         if not self.anchor_inputs:
@@ -337,6 +423,7 @@ class TFBStatCalculator(StatCalculator):
         # 2. Search
         low, high = self.beta_min, self.beta_max
         best_beta = low
+        history = []
 
         for i in range(self.beta_search_steps):
             mid = (low + high) / 2
@@ -345,6 +432,13 @@ class TFBStatCalculator(StatCalculator):
 
             curr_val = metric_fn(model, self.anchor_inputs, calibration_targets)
             degradation = curr_val - baseline_val
+            history.append(
+                {
+                    "beta": mid,
+                    "metric": curr_val,
+                    "degradation": degradation,
+                }
+            )
 
             log.info(
                 f"TFB: Iter {i + 1}, Beta={mid:.4f}, Metric={curr_val:.4f}, Delta={degradation:.4f}"
@@ -355,6 +449,15 @@ class TFBStatCalculator(StatCalculator):
                 low = mid  # Try more noise
             else:
                 high = mid  # Too much noise
+
+        self._calibration_summary = {
+            "mode": self.calibration_mode,
+            "baseline_metric": baseline_val,
+            "epsilon": self.epsilon,
+            "history": history,
+            "best_beta": best_beta,
+            "anchor_size": len(calibration_targets),
+        }
 
         return best_beta
 
@@ -386,58 +489,52 @@ class TFBStatCalculator(StatCalculator):
             set_tfb_mode(model.model, True)
 
             bs = self.batch_size if self.batch_size > 0 else 1
-            
+
             # Classification mode: use forward pass at last input position
             if self.target_ids is not None:
-                target_ids_tensor = torch.tensor(self.target_ids, device=model.device())
-                
+                if not self._target_token_indices:
+                    self._configure_target_ids(self.target_ids)
+
                 for i in range(0, len(texts), bs):
                     chunk_texts = texts[i : i + bs]
-                    
+
                     for text in chunk_texts:
-                        # Tokenize once per input
                         batch_tokens = model.tokenize([text])
                         batch_tokens = {
                             k: v.to(model.device()) for k, v in batch_tokens.items()
                         }
-                        
+
                         sample_texts = []
                         sample_log_probs = []
                         sample_target_probs = []
-                        
-                        # Multiple forward passes for TFB samples
+
                         with torch.no_grad():
                             for _ in range(self.n_samples):
-                                # Forward pass (no generation)
-                                logits = model.model(**batch_tokens).logits  # [1, seq_len, vocab]
-                                
-                                # Get last input token position
-                                attention_mask = batch_tokens["attention_mask"][0]
-                                last_idx = attention_mask.sum() - 1
-                                
-                                # Extract logits at last position for target tokens
-                                last_logits = logits[0, last_idx, target_ids_tensor]
-                                probs = torch.softmax(last_logits, dim=-1)
-                                log_probs = torch.log_softmax(last_logits, dim=-1)
-                                
-                                sample_target_probs.append(probs.cpu().tolist())
-                                sample_log_probs.append(log_probs.cpu().tolist())
-                                
-                                # Decode the predicted token for consistency
-                                pred_idx = probs.argmax().item()
-                                pred_token_id = self.target_ids[pred_idx]
+                                logits = model.model(**batch_tokens).logits
+                                class_probs = self._compute_class_probs(
+                                    logits, batch_tokens["attention_mask"]
+                                ).squeeze(0)
+                                probs_tensor = class_probs.detach()
+                                log_probs_tensor = torch.log(
+                                    torch.clamp(probs_tensor, min=1e-12)
+                                )
+
+                                sample_target_probs.append(probs_tensor.cpu().tolist())
+                                sample_log_probs.append(log_probs_tensor.cpu().tolist())
+
+                                pred_idx = int(probs_tensor.argmax().item())
+                                pred_token_id = self._class_primary_tokens[pred_idx]
                                 pred_text = model.tokenizer.decode([pred_token_id])
                                 sample_texts.append(pred_text)
-                        
+
                         all_res_texts.append(sample_texts)
                         all_res_log_probs.append(sample_log_probs)
                         all_res_tokens.append([[] for _ in range(self.n_samples)])
                         all_res_target_probs.append(sample_target_probs)
-                        
-                        # Clean up
+
                         del batch_tokens
                         torch.cuda.empty_cache()
-            
+
             # Generation mode: use model.generate()
             else:
                 for i in range(0, len(texts), bs):
@@ -531,4 +628,5 @@ class TFBStatCalculator(StatCalculator):
             f"{self.stats_key}_log_probs": all_res_log_probs,
             f"{self.stats_key}_tokens": all_res_tokens,
             f"{self.stats_key}_target_probs": all_res_target_probs,
+            f"{self.stats_key}_metadata": self._build_metadata(),
         }
