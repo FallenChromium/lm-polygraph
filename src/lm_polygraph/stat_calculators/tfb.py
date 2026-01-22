@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Sequence as SequenceABC
 from typing import Literal, Sequence
 
 import numpy as np
@@ -333,15 +334,38 @@ class TFBStatCalculator(StatCalculator):
                     seen.add(tid_int)
                     normalized.append([tid_int])
         else:
+
+            def _collect_token_ids(node, buffer: list[int]):
+                if isinstance(node, torch.Tensor):
+                    if node.numel() == 0:
+                        return
+                    buffer.extend(node.reshape(-1).tolist())
+                    return
+                if isinstance(node, np.ndarray):
+                    if node.size == 0:
+                        return
+                    buffer.extend(node.reshape(-1).tolist())
+                    return
+                if isinstance(node, SequenceABC) and not isinstance(
+                    node, (str, bytes, bytearray)
+                ):
+                    if not node:
+                        return
+                    for child in node:
+                        _collect_token_ids(child, buffer)
+                else:
+                    buffer.append(int(node))
+
             for group in target_ids:
-                if not isinstance(group, Sequence) or len(group) == 0:
+                if not isinstance(group, SequenceABC) or len(group) == 0:
                     raise ValueError(
                         "Each target_id group must be a non-empty sequence."
                     )
+                flat_tokens: list[int] = []
+                _collect_token_ids(group, flat_tokens)
                 seen = set()
                 deduped: list[int] = []
-                for tid in group:
-                    tid_int = int(tid)
+                for tid_int in flat_tokens:
                     if tid_int not in seen:
                         seen.add(tid_int)
                         deduped.append(tid_int)
