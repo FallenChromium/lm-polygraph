@@ -25,7 +25,7 @@ ADAPTER_REPO = "FlyLee/bayesian-peft"
 ADAPTER_SUBFOLDER = "blob/meta-llama/Meta-Llama-3.1-8B/obqa/blob-obqa-sample10-eps0.05-kllr0.0075-beta0.15-seed1"
 DATASET_NAME = "ai2_arc"
 DATASET_SUBSET = "ARC-Easy"
-ANCHOR_SIZE = 400
+ANCHOR_SIZE = 500
 
 
 def setup_oom_snapshot(filename="oom_snapshot.pickle"):
@@ -162,7 +162,7 @@ anchor_ds = (
     .shuffle(seed=42)
     .select(range(min(ANCHOR_SIZE, len(dataset_full["train"]))))
 )
-eval_ds = dataset_full["validation"].select(range(50))
+eval_ds = dataset_full["validation"]  # Use full validation set
 
 preamble = """Answer the science question by choosing the correct option letter.
 
@@ -238,7 +238,7 @@ calc = TFBStatCalculator(
     anchor_inputs=anchor_inputs,
     target_ids=target_ids,  # Enable classification mode
     calibration_mode="seq_nll",
-    batch_size=1,
+    batch_size=8,  # Increased for better performance
     target_epsilon=0.003,
     n_samples=10,
     use_softplus=True,
