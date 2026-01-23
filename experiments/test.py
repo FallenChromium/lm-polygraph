@@ -25,7 +25,7 @@ ADAPTER_REPO = "FlyLee/bayesian-peft"
 ADAPTER_SUBFOLDER = "blob/meta-llama/Meta-Llama-3.1-8B/obqa/blob-obqa-sample10-eps0.05-kllr0.0075-beta0.15-seed1"
 DATASET_NAME = "ai2_arc"
 DATASET_SUBSET = "ARC-Easy"
-ANCHOR_SIZE = 150
+ANCHOR_SIZE = 400
 
 
 def setup_oom_snapshot(filename="oom_snapshot.pickle"):
@@ -193,7 +193,8 @@ eval_inputs = [
 # 4. Prepare target_ids for classification
 # ==========================================
 labels = ["A", "B", "C", "D", "E"]
-label_variants = [[lbl, f" {lbl}"] for lbl in labels]
+# label_variants = [[lbl, f" {lbl}"] for lbl in labels]
+label_variants = [[lbl] for lbl in labels]
 
 
 def _encode_variant(text: str) -> list[int]:
