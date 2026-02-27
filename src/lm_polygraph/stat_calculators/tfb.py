@@ -12,6 +12,24 @@ from lm_polygraph.utils.model import WhiteboxModel
 log = logging.getLogger("lm_polygraph")
 
 
+TFB_SIGMA_EPS = 1e-6
+
+
+def _compute_target_sigma(
+    beta: float, singular_values: torch.Tensor, in_features: int
+) -> torch.Tensor:
+    """Reference-compatible sigma target: beta / (D + eps)."""
+    beta_value = max(float(beta), 0.0)
+    d_safe = singular_values.reshape(-1, 1).expand(-1, in_features) + TFB_SIGMA_EPS
+    return beta_value / d_safe
+
+
+def _sigma_to_rho(target_sigma: torch.Tensor, use_softplus: bool) -> torch.Tensor:
+    if use_softplus:
+        return torch.log(torch.expm1(target_sigma) + TFB_SIGMA_EPS)
+    return torch.sqrt(torch.clamp(target_sigma, min=0.0))
+
+
 def patch_model_for_tfb(
     model: nn.Module, initial_beta: float = 0.0, use_softplus: bool = False
 ) -> bool:
@@ -47,14 +65,8 @@ def patch_model_for_tfb(
 
             in_features = module.in_features
 
-            # Prevent division by zero with small epsilon
-            D_safe = D.reshape(-1, 1).expand(-1, in_features) + 1e-6
-            target_sigma = torch.sqrt(initial_beta / D_safe)
-
-            if use_softplus:
-                rho = torch.log(torch.exp(target_sigma) - 1 + 1e-6)
-            else:
-                rho = torch.sqrt(target_sigma)
+            target_sigma = _compute_target_sigma(initial_beta, D, in_features)
+            rho = _sigma_to_rho(target_sigma, use_softplus)
 
             rho = rho.to(lora_A.weight.dtype)
 
@@ -182,14 +194,8 @@ def update_tfb_beta(model: nn.Module, beta: float):
             D = module.tfb_singular_values[adapter_name]
             in_features = module.in_features
 
-            D_safe = D.reshape(-1, 1).expand(-1, in_features) + 1e-6
-
-            target_sigma = torch.sqrt(beta / D_safe)
-
-            if use_softplus:
-                new_rho = torch.log(torch.exp(target_sigma) - 1 + 1e-6)
-            else:
-                new_rho = torch.sqrt(target_sigma)
+            target_sigma = _compute_target_sigma(beta, D, in_features)
+            new_rho = _sigma_to_rho(target_sigma, use_softplus)
 
             module.tfb_rho[adapter_name].data.copy_(
                 new_rho.to(module.tfb_rho[adapter_name].dtype)
@@ -230,6 +236,7 @@ class TFBStatCalculator(StatCalculator):
         beta_search_steps: int = 10,
         use_softplus: bool = False,
         batch_size: int = 8,
+        max_seq_len: int | None = None,
         calibration_mode: Literal["seq_nll", "exact_match"] = "seq_nll",
     ):
         self.stats_key = stats_key
@@ -247,6 +254,7 @@ class TFBStatCalculator(StatCalculator):
         self.beta_search_steps = beta_search_steps
         self.use_softplus = use_softplus
         self.batch_size = batch_size
+        self.max_seq_len = max_seq_len if max_seq_len is None or max_seq_len > 0 else None
         self.calibration_mode = calibration_mode
 
         # State
@@ -412,8 +420,38 @@ class TFBStatCalculator(StatCalculator):
             "beta": self.beta,
             "calibration": self._calibration_summary,
             "n_samples": self.n_samples,
+            "max_seq_len": self.max_seq_len,
             "mode": "classification" if self.target_ids is not None else "generation",
         }
+
+    def _tokenize_classification_text(
+        self, model: WhiteboxModel, text: str
+    ) -> dict[str, torch.Tensor]:
+        if self.max_seq_len is None:
+            return model.tokenize([text])
+
+        if model.instruct:
+            chat = [{"role": "user", "content": text}]
+            formatted = model.tokenizer.apply_chat_template(
+                chat, add_generation_prompt=True, tokenize=False
+            )
+            return model.tokenizer(
+                [formatted],
+                padding=True,
+                return_tensors="pt",
+                add_special_tokens=False,
+                truncation=True,
+                max_length=self.max_seq_len,
+            )
+
+        return model.tokenizer(
+            [text],
+            padding=True,
+            return_tensors="pt",
+            add_special_tokens=True,
+            truncation=True,
+            max_length=self.max_seq_len,
+        )
 
     def _binary_search(self, model: WhiteboxModel) -> float:
         """Performs the TFB calibration."""
@@ -437,10 +475,7 @@ class TFBStatCalculator(StatCalculator):
                 model, self.anchor_inputs, max_new_tokens=20
             )
 
-        if self.calibration_mode == "seq_nll":
-            baseline_val = metric_fn(model, self.anchor_inputs, calibration_targets)
-        else:
-            baseline_val = 0.0
+        baseline_val = metric_fn(model, self.anchor_inputs, calibration_targets)
 
         log.info(f"TFB: Baseline Metric ({self.calibration_mode}) = {baseline_val:.4f}")
 
@@ -494,6 +529,12 @@ class TFBStatCalculator(StatCalculator):
     ) -> dict[str, np.ndarray]:
         patch_model_for_tfb(model.model, use_softplus=self.use_softplus)
 
+        if self.beta is None and self.target_ids is None:
+            raise NotImplementedError(
+                "Generation-mode beta search is temporarily disabled. "
+                "Provide a fixed beta for generation mode."
+            )
+
         if self.beta is None:
             if not self._is_calibrated:
                 self.beta = self._binary_search(model)
@@ -523,7 +564,7 @@ class TFBStatCalculator(StatCalculator):
                     chunk_texts = texts[i : i + bs]
 
                     for text in chunk_texts:
-                        batch_tokens = model.tokenize([text])
+                        batch_tokens = self._tokenize_classification_text(model, text)
                         batch_tokens = {
                             k: v.to(model.device()) for k, v in batch_tokens.items()
                         }

@@ -86,8 +86,11 @@ def _histogram_ece(
     bins = np.linspace(0.0, 1.0, num_bins + 1)
     ece = 0.0
 
-    for low, high in zip(bins[:-1], bins[1:]):
-        mask = (confidences >= low) & (confidences < high)
+    for idx, (low, high) in enumerate(zip(bins[:-1], bins[1:])):
+        if idx == num_bins - 1:
+            mask = (confidences >= low) & (confidences <= high)
+        else:
+            mask = (confidences >= low) & (confidences < high)
         count = mask.sum()
         if count == 0:
             continue
