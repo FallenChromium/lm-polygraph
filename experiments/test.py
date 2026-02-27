@@ -50,7 +50,9 @@ class TraceWriter:
         self.enabled = bool(trace_dir)
         self.run_id = run_id
         self.seed = seed
-        self.trace_dir = Path(trace_dir).resolve() if trace_dir else None
+        self.trace_dir = (
+            (Path(trace_dir).resolve() / run_id) if trace_dir else None
+        )
         if self.enabled:
             self.trace_dir.mkdir(parents=True, exist_ok=True)
 
@@ -321,6 +323,14 @@ def _compute_batch_summary(
     labels_slice: np.ndarray,
     num_bins: int,
 ) -> dict[str, Any]:
+    probs_slice = np.asarray(probs_slice, dtype=np.float64)
+    probs_slice = np.nan_to_num(probs_slice, nan=0.0, posinf=0.0, neginf=0.0)
+    denom = probs_slice.sum(axis=-1, keepdims=True)
+    valid = denom > 0
+    probs_slice = probs_slice / np.clip(denom, a_min=1e-12, a_max=None)
+    if not bool(valid.all()):
+        probs_slice[~valid[..., 0]] = 1.0 / probs_slice.shape[-1]
+
     mean_probs = probs_slice.mean(axis=1)
     preds = mean_probs.argmax(axis=1)
     conf = mean_probs.max(axis=1)
@@ -415,6 +425,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tfb-key", default="tfb_arc_repro")
     parser.add_argument("--trace-dir", default=None)
+    parser.add_argument(
+        "--trace-save-probs",
+        action="store_true",
+        help="Persist full mean/per-sample probability tensors for deep debugging.",
+    )
     parser.add_argument("--enable-oom-snapshot", action="store_true")
 
     return parser.parse_args()
@@ -524,6 +539,7 @@ Answer:"""
         {
             "run_id": run_id,
             "params": vars(args),
+            "trace_output_dir": str(trace.trace_dir) if trace.enabled else None,
             "model": {
                 "name": args.model_name,
                 "dtype": str(next(model.parameters()).dtype),
@@ -657,7 +673,19 @@ Answer:"""
         "tfb_metadata": metadata,
     }
     trace.write_json("final_metrics.json", final_metrics)
-    trace.event("metrics", "final", **final_metrics)
+    trace.event(
+        "metrics",
+        "final",
+        metrics=final_metrics["metrics"],
+        evaluated_count=final_metrics["evaluated_count"],
+        beta=final_metrics["beta"],
+    )
+    if trace.enabled and args.trace_save_probs:
+        np.savez_compressed(
+            trace.trace_dir / "prob_tensors.npz",
+            mean_probs=np.asarray(metrics["mean_probs"], dtype=np.float32),
+            per_sample_probs=np.asarray(metrics["per_sample_probs"], dtype=np.float32),
+        )
 
     seq_est = TFBSequenceEstimator(stats_key=args.tfb_key)
     uncertainties = seq_est(stats)
