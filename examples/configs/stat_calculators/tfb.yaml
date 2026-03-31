@@ -1,0 +1,30 @@
+# TFB stat-calculator config (generic).
+# Designed for MCQ datasets with classification mode.
+# Target labels are resolved to token IDs at runtime via the model tokenizer,
+# so this config works with any model without hardcoded token IDs.
+
+- name: TFBStatCalculator
+  builder: lm_polygraph.defaults.stat_calculator_builders.default_TFBStatCalculator
+  cfg:
+    stats_key: tfb
+
+    # Anchor set: use train split for calibration (loaded dynamically)
+    anchor_inputs: null
+
+    # Labels resolved at runtime via the model tokenizer.
+    # Override per-dataset (e.g. add "E" for ARC).
+    target_labels: ["A", "B", "C", "D"]
+
+    n_samples: 10
+    batch_size: 4
+    max_seq_len: null
+
+    # Fixed-beta for reproducibility
+    beta: 0.001
+    use_softplus: false
+
+    # Beta search (set beta: null to enable)
+    target_epsilon: 0.003
+    beta_range: [0.001, 0.2]
+    beta_search_steps: 10
+    calibration_mode: seq_nll

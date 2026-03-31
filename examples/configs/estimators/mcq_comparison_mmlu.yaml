@@ -1,0 +1,16 @@
+# UE estimator comparison for MMLU
+
+- name: MaximumSequenceProbability
+- name: Perplexity
+- name: MeanTokenEntropy
+- name: MonteCarloSequenceEntropy
+- name: MonteCarloNormalizedSequenceEntropy
+- name: SemanticEntropy
+- name: LexicalSimilarity
+  cfg:
+    metric: "rouge1"
+- name: NumSemSets
+
+- name: TFBSequenceEstimator
+  cfg:
+    stats_key: tfb_mmlu

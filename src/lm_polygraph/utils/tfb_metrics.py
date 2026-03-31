@@ -138,6 +138,14 @@ def tfb_classification_metrics(
     """
     probs, labels = _validate_inputs(stats, stats_key, true_labels, expected_classes)
 
+    # Numerical robustness: replace degenerate values and re-normalise
+    probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+    sample_sums = probs.sum(axis=-1, keepdims=True)
+    valid = sample_sums > 0
+    probs = probs / np.clip(sample_sums, a_min=1e-12, a_max=None)
+    if not bool(valid.all()):
+        probs[~valid[..., 0]] = 1.0 / probs.shape[-1]
+
     # Bayesian model averaging over TFB samples
     mean_probs = probs.mean(axis=1)
     eps = 1e-12

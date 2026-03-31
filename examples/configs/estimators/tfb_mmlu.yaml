@@ -1,0 +1,6 @@
+# TFB estimator config for MMLU evaluation.
+# Must match stats_key from stat_calculators/tfb_mmlu.yaml.
+
+- name: TFBSequenceEstimator
+  cfg:
+    stats_key: tfb_mmlu

@@ -1,6 +1,20 @@
+"""
+Training-Free Bayesianization (TFB) stat calculator.
+
+Adds calibrated Gaussian noise to LoRA adapter weights via Flipout to obtain
+a posterior approximation *without* retraining.  Multiple stochastic forward
+passes yield a distribution over predictions whose spread is used as an
+uncertainty signal.
+
+Reference
+---------
+Wang et al., "Training-Free Bayesianization for Low-Rank Adaptation of
+Large Language Models", arXiv 2412.05723, 2024.
+"""
+
 import logging
 from collections.abc import Sequence as SequenceABC
-from typing import Literal, Sequence
+from typing import List, Literal, Optional, Sequence
 
 import numpy as np
 import torch
@@ -12,30 +26,46 @@ from lm_polygraph.utils.model import WhiteboxModel
 log = logging.getLogger("lm_polygraph")
 
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 TFB_SIGMA_EPS = 1e-6
 
 
+# ---------------------------------------------------------------------------
+# Math helpers
+# ---------------------------------------------------------------------------
 def _compute_target_sigma(
     beta: float, singular_values: torch.Tensor, in_features: int
 ) -> torch.Tensor:
-    """Reference-compatible sigma target: beta / (D + eps)."""
+    """Reference-compatible sigma target: ``beta / (D + eps)``."""
     beta_value = max(float(beta), 0.0)
     d_safe = singular_values.reshape(-1, 1).expand(-1, in_features) + TFB_SIGMA_EPS
     return beta_value / d_safe
 
 
 def _sigma_to_rho(target_sigma: torch.Tensor, use_softplus: bool) -> torch.Tensor:
+    """Convert target sigma to the rho parameterisation used during sampling."""
     if use_softplus:
         return torch.log(torch.expm1(target_sigma) + TFB_SIGMA_EPS)
     return torch.sqrt(torch.clamp(target_sigma, min=0.0))
 
 
+# ---------------------------------------------------------------------------
+# Model patching – SVD rotation + Flipout forward
+# ---------------------------------------------------------------------------
 def patch_model_for_tfb(
     model: nn.Module, initial_beta: float = 0.0, use_softplus: bool = False
 ) -> bool:
-    # Check if already patched
+    """Decompose LoRA-B via SVD and install the Flipout forward hook.
+
+    Raises
+    ------
+    ValueError
+        If the model contains no LoRA adapter layers (``lora_A`` / ``lora_B``).
+    """
     if hasattr(model, "_tfb_patched"):
-        log.info("Model already patched for TFB. Skipping SVD re-computation.")
+        log.info("Model already patched for TFB – skipping SVD re-computation.")
         return False
 
     patched_any = False
@@ -43,86 +73,78 @@ def patch_model_for_tfb(
     for module in model.modules():
         if not (hasattr(module, "lora_A") and hasattr(module, "lora_B")):
             continue
-
-        # Skip if already patched
         if hasattr(module, "_tfb_patched"):
             continue
 
-        # Store TFB state per adapter: {adapter_name: (rho, singular_values)}
         module.tfb_rho = nn.ParameterDict()
-        module.tfb_singular_values = {}  # Not parameters, just cached
+        module.tfb_singular_values = {}
         module.tfb_beta = initial_beta
         module.tfb_enabled = False
         module.tfb_use_softplus = use_softplus
 
-        # Initialize for each adapter
         for adapter_name in module.lora_A.keys():
             lora_A = module.lora_A[adapter_name]
             lora_B = module.lora_B[adapter_name]
 
             # SVD of B: B = U @ diag(D) @ Vh
             U, D, Vh = torch.linalg.svd(lora_B.weight.float(), full_matrices=False)
-
             in_features = module.in_features
 
             target_sigma = _compute_target_sigma(initial_beta, D, in_features)
-            rho = _sigma_to_rho(target_sigma, use_softplus)
+            rho = _sigma_to_rho(target_sigma, use_softplus).to(lora_A.weight.dtype)
 
-            rho = rho.to(lora_A.weight.dtype)
-
-            # Store state
             module.tfb_rho[adapter_name] = nn.Parameter(rho)
-            module.tfb_singular_values[adapter_name] = D  # Cache for beta updates
+            module.tfb_singular_values[adapter_name] = D
 
-            # Transform weights to SVD basis (one-time)
+            # Rotate weights into SVD basis (one-time transformation)
             lora_B.weight = nn.Parameter((U @ torch.diag(D)).to(lora_B.weight.dtype))
             lora_A.weight = nn.Parameter(
                 (Vh @ lora_A.weight.float()).to(lora_A.weight.dtype)
             )
 
-        # Replace forward method
-        original_forward = module.forward
-        module.forward = _create_tfb_forward(original_forward, module)
-
+        module.forward = _create_tfb_forward(module.forward, module)
         module._tfb_patched = True
         patched_any = True
 
-    # Mark model as globally patched
+    if not patched_any:
+        raise ValueError(
+            "TFB requires a model with LoRA adapters (lora_A / lora_B modules). "
+            "No LoRA layers were found.  Make sure you have applied a LoRA "
+            "config (e.g. via peft.get_peft_model) before calling "
+            "patch_model_for_tfb."
+        )
+
     model._tfb_patched = True
     return patched_any
 
 
 def _create_tfb_forward(original_forward, module):
-    """Creates the TFB-aware forward function (called once during patching)"""
+    """Return a Flipout-aware forward replacing the original LoRA forward."""
 
     def forward(x: torch.Tensor, *args, **kwargs):
         dtype = x.dtype
 
-        # 1. Deterministic LoRA pass
+        # --- deterministic LoRA pass ---
         result = module.base_layer(x, *args, **kwargs)
         for adapter in module.active_adapters:
             if adapter not in module.lora_A:
                 continue
-
             lora_A = module.lora_A[adapter]
             lora_B = module.lora_B[adapter]
             dropout = module.lora_dropout[adapter]
             scaling = module.scaling[adapter]
-
             x_casted = x.to(lora_A.weight.dtype)
             result = result + lora_B(lora_A(dropout(x_casted))) * scaling
 
-        # 2. Stochastic noise (if enabled)
+        # --- stochastic noise via Flipout ---
         if module.tfb_enabled:
             for adapter in module.active_adapters:
                 if adapter not in module.tfb_rho:
                     continue
-
                 lora_A = module.lora_A[adapter]
                 lora_B = module.lora_B[adapter]
                 dropout = module.lora_dropout[adapter]
                 scaling = module.scaling[adapter]
-
                 rho = module.tfb_rho[adapter]
 
                 if module.tfb_use_softplus:
@@ -133,9 +155,7 @@ def _create_tfb_forward(original_forward, module):
                 x_casted = x.to(lora_A.weight.dtype)
                 x_dropped = dropout(x_casted)
 
-                # Flipout: pseudo-independent noise using Rademacher signs
                 bs = x_dropped.size(0)
-                seq_len = x_dropped.size(1) if x_dropped.dim() == 3 else 1
                 r_dim = module.in_features
 
                 if x_dropped.dim() == 2:
@@ -151,6 +171,7 @@ def _create_tfb_forward(original_forward, module):
                         - 1
                     )
                 else:
+                    seq_len = x_dropped.size(1)
                     r = (
                         torch.randint(
                             0, 2, (bs, seq_len, r_dim), device=x.device
@@ -166,10 +187,7 @@ def _create_tfb_forward(original_forward, module):
                         - 1
                     )
 
-                noise_base = torch.randn_like(lora_A.weight)
-                noise_A = noise_base * sigma
-
-                # Apply Flipout transformation
+                noise_A = torch.randn_like(lora_A.weight) * sigma
                 perturb = (((x_dropped * r) @ noise_A.T) * s) @ lora_B.weight.T
                 result = result + perturb * scaling
 
@@ -178,164 +196,191 @@ def _create_tfb_forward(original_forward, module):
     return forward
 
 
+# ---------------------------------------------------------------------------
+# Runtime helpers – beta update & mode toggle
+# ---------------------------------------------------------------------------
 def update_tfb_beta(model: nn.Module, beta: float):
-    """
-    Update noise scale across all TFB modules.
-    Fast: uses cached singular values, no re-SVD.
-    """
+    """Update the noise scale across all patched LoRA layers (no re-SVD)."""
     for module in model.modules():
         if not hasattr(module, "tfb_rho"):
             continue
-
         module.tfb_beta = beta
         use_softplus = module.tfb_use_softplus
-
         for adapter_name in module.tfb_rho.keys():
             D = module.tfb_singular_values[adapter_name]
-            in_features = module.in_features
-
-            target_sigma = _compute_target_sigma(beta, D, in_features)
+            target_sigma = _compute_target_sigma(beta, D, module.in_features)
             new_rho = _sigma_to_rho(target_sigma, use_softplus)
-
             module.tfb_rho[adapter_name].data.copy_(
                 new_rho.to(module.tfb_rho[adapter_name].dtype)
             )
 
 
 def set_tfb_mode(model: nn.Module, enabled: bool):
-    """Toggle stochastic sampling on/off"""
+    """Toggle stochastic sampling on / off."""
     for module in model.modules():
         if hasattr(module, "tfb_enabled"):
             module.tfb_enabled = enabled
 
 
+# ---------------------------------------------------------------------------
+# Stat-key helper
+# ---------------------------------------------------------------------------
+def tfb_stats_for_key(stats_key: str = "tfb") -> List[str]:
+    """Return the list of stat names produced by a TFBStatCalculator."""
+    return [
+        f"{stats_key}_texts",
+        f"{stats_key}_log_probs",
+        f"{stats_key}_tokens",
+        f"{stats_key}_target_probs",
+        f"{stats_key}_metadata",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# TFBStatCalculator
+# ---------------------------------------------------------------------------
 class TFBStatCalculator(StatCalculator):
+    """Compute stochastic forward-pass statistics for classification tasks.
+
+    In **classification mode** (``target_ids`` or ``target_labels`` provided),
+    the calculator extracts next-token class probabilities from the last input
+    position across ``n_samples`` stochastic forward passes.
+
+    Free-form generation mode is *not* supported – the semantic interpretation
+    of TFB uncertainty for open-ended text has not been established.
+
+    Parameters
+    ----------
+    stats_key : str
+        Unique prefix for the stat names this instance produces.
+    target_ids : sequence, optional
+        Per-class token-id groups, e.g. ``[[32, 319], [33, 347], ...]``.
+        Mutually complementary with *target_labels* (at least one required).
+    target_labels : list[str], optional
+        Human-readable class labels (e.g. ``["A", "B", "C", "D"]``).
+        Resolved to token ids at runtime using the model tokenizer.
+    anchor_inputs / anchor_targets : list[str], optional
+        Held-out prompts (and optionally their gold completions) used by the
+        binary-search beta calibration.
+    beta : float, optional
+        Fixed noise scale.  If ``None``, beta is calibrated automatically
+        (requires *anchor_inputs*).
+    n_samples : int
+        Number of stochastic forward passes per input.
+    max_seq_len : int, optional
+        Truncation limit passed to the tokenizer.  ``None`` = no truncation.
+
+    Notes
+    -----
+    This method requires a **LoRA-adapted** model.  ``patch_model_for_tfb``
+    will raise ``ValueError`` if no LoRA layers are found.
+
+    The simple ``estimate_uncertainty(model, estimator, text)`` API cannot be
+    used with TFB because TFB needs dataset-level configuration (target ids,
+    anchor set, LoRA model).  Use ``polygraph_eval`` with a YAML config or
+    instantiate ``UEManager`` directly.
+    """
+
     @staticmethod
     def meta_info() -> tuple[list[str], list[str]]:
-        return (
-            [
-                "tfb_texts",
-                "tfb_log_probs",
-                "tfb_tokens",
-                "tfb_target_probs",
-                "tfb_metadata",
-            ],
-            [],
-        )
+        # Static fallback (stats_key="tfb").  Instances override ``_stats``
+        # in __init__ to match their actual stats_key.
+        return (tfb_stats_for_key("tfb"), [])
 
     def __init__(
         self,
-        stats_key: str,
-        anchor_inputs: list[str] = None,
-        anchor_targets: list[str] = None,
-        target_ids: Sequence[int] | Sequence[Sequence[int]] | None = None,
+        stats_key: str = "tfb",
+        anchor_inputs: Optional[List[str]] = None,
+        anchor_targets: Optional[List[str]] = None,
+        target_ids: Optional[Sequence] = None,
+        target_labels: Optional[List[str]] = None,
         n_samples: int = 5,
         target_epsilon: float = 0.003,
-        beta: float | None = None,
-        beta_range: tuple[float, float] = (0.001, 0.2),
+        beta: Optional[float] = None,
+        beta_range: tuple = (0.001, 0.2),
         beta_search_steps: int = 10,
         use_softplus: bool = False,
         batch_size: int = 8,
-        max_seq_len: int | None = None,
+        max_seq_len: Optional[int] = None,
         calibration_mode: Literal["seq_nll", "exact_match"] = "seq_nll",
     ):
         self.stats_key = stats_key
         super().__init__()
+        self._stats = tfb_stats_for_key(stats_key)
 
         self.anchor_inputs = anchor_inputs or []
         self.anchor_targets = anchor_targets or []
         self.target_ids = target_ids
-        self._target_token_indices: list[torch.Tensor] | None = None
-        self._class_primary_tokens: list[int] = []
+        self.target_labels = target_labels
+        self._target_token_indices: Optional[List[torch.Tensor]] = None
+        self._class_primary_tokens: List[int] = []
         self.n_samples = n_samples
         self.epsilon = target_epsilon
         self.beta = beta
         self.beta_min, self.beta_max = beta_range
         self.beta_search_steps = beta_search_steps
         self.use_softplus = use_softplus
-        self.batch_size = batch_size
-        self.max_seq_len = max_seq_len if max_seq_len is None or max_seq_len > 0 else None
+        self.batch_size = max(batch_size, 1)
+        self.max_seq_len = (
+            max_seq_len if max_seq_len is None or max_seq_len > 0 else None
+        )
         self.calibration_mode = calibration_mode
 
-        # State
         self._is_calibrated = self.beta is not None
-        # Store comparison baseline if needed
-        self._calibration_baseline = None
         self._calibration_summary: dict = {}
+
         if self.target_ids is not None:
             self._configure_target_ids(self.target_ids)
 
-    def _metric_seq_nll(self, model, inputs, targets) -> float:
-        """Helper to calculate NLL for the anchor set (Self-Consistency)."""
-        # TODO: should there be more than 1 sample in calibration?
-        nlls = []
-        hf_model = model.model
-        tokenizer = model.tokenizer
+    # ------------------------------------------------------------------
+    # Target-ID configuration
+    # ------------------------------------------------------------------
+    def _resolve_target_labels(self, tokenizer) -> None:
+        """Convert ``self.target_labels`` to token-id groups using *tokenizer*.
 
-        for inp, trg in zip(inputs, targets):
-            try:
-                full_text = inp + trg
-                enc = tokenizer(full_text, return_tensors="pt").to(model.device())
-                labels = enc.input_ids.clone()
+        Each label string is tokenized with and without a leading space;
+        the last token of each variant is used as the class representative.
+        Results are cached so this runs only once.
+        """
+        if self._target_token_indices is not None:
+            return  # already resolved
+        if not self.target_labels:
+            return
 
-                # Mask out input part
-                inp_len = tokenizer(inp, return_tensors="pt").input_ids.shape[1]
-                labels[:, :inp_len] = -100
+        target_ids: list[list[list[int]]] = []
+        debug_map = {}
+        for label in self.target_labels:
+            variants = [f" {label}", label]
+            class_sequences: list[list[int]] = []
+            decoded: list[str] = []
+            for variant in variants:
+                ids = tokenizer(variant, add_special_tokens=False).input_ids
+                if ids:
+                    seq = [ids[-1]]
+                    if seq not in class_sequences:
+                        class_sequences.append(seq)
+                        decoded.append(tokenizer.decode(seq))
+            if not class_sequences:
+                # Absolute fallback – encode the raw label
+                ids = tokenizer.encode(label, add_special_tokens=False)
+                class_sequences = [[ids[-1]]] if ids else [[0]]
+                decoded = [tokenizer.decode(class_sequences[0])]
+            target_ids.append(class_sequences)
+            debug_map[label] = decoded
 
-                with torch.no_grad():
-                    outputs = hf_model(**enc, labels=labels)
-                    nlls.append(outputs.loss.item())
-            except Exception as e:
-                log.warning(f"TFB Eval Error (seq_nll): {e}")
-                return 100.0
+        log.info(f"TFB: resolved target_labels → token map: {debug_map}")
+        self._configure_target_ids(target_ids)
 
-        return np.mean(nlls)
-
-    def _chunked_generate_texts(self, model, texts, max_new_tokens):
-        results = []
-        bs = self.batch_size if self.batch_size > 0 else 4
-        for i in range(0, len(texts), bs):
-            batch = texts[i : i + bs]
-            results.extend(model.generate_texts(batch, max_new_tokens=max_new_tokens))
-        return results
-
-    def _metric_exact_match(self, model, inputs, targets) -> float:
-        """Helper to calculate mismatch rate (Flip Rate)."""
-        mismatches = 0
-        total = 0
-
-        try:
-            generated_texts = self._chunked_generate_texts(
-                model,
-                inputs,
-                max_new_tokens=10,
-            )
-            for gen, target in zip(generated_texts, targets):
-                if gen.strip() != target.strip():
-                    mismatches += 1
-                total += 1
-        except Exception as e:
-            log.warning(f"TFB Eval Error (exact_match): {e}")
-            return 1.0  # Max error
-
-        return mismatches / total if total > 0 else 0.0
-
-    def _get_calibration_metric_fn(self):
-        if self.calibration_mode == "seq_nll":
-            return self._metric_seq_nll
-        elif self.calibration_mode == "exact_match":
-            return self._metric_exact_match
-        else:
-            raise ValueError(f"Unknown calibration mode: {self.calibration_mode}")
-
-    def _configure_target_ids(self, target_ids: Sequence):
+    def _configure_target_ids(self, target_ids: Sequence) -> None:
+        """Normalise *target_ids* (various formats) into ``_target_token_indices``."""
         if not target_ids:
             raise ValueError("target_ids must not be empty when provided.")
+
         first = target_ids[0]
         normalized: list[list[int]] = []
 
         if isinstance(first, int):
-            seen = set()
+            seen: set = set()
             for tid in target_ids:
                 tid_int = int(tid)
                 if tid_int not in seen:
@@ -343,40 +388,28 @@ class TFBStatCalculator(StatCalculator):
                     normalized.append([tid_int])
         else:
 
-            def _collect_token_ids(node, buffer: list[int]):
+            def _collect(node, buf: list):
                 if isinstance(node, torch.Tensor):
-                    if node.numel() == 0:
-                        return
-                    buffer.extend(node.reshape(-1).tolist())
-                    return
-                if isinstance(node, np.ndarray):
-                    if node.size == 0:
-                        return
-                    buffer.extend(node.reshape(-1).tolist())
-                    return
-                if isinstance(node, SequenceABC) and not isinstance(
+                    buf.extend(node.reshape(-1).tolist()) if node.numel() else None
+                elif isinstance(node, np.ndarray):
+                    buf.extend(node.reshape(-1).tolist()) if node.size else None
+                elif isinstance(node, SequenceABC) and not isinstance(
                     node, (str, bytes, bytearray)
                 ):
-                    if not node:
-                        return
                     for child in node:
-                        _collect_token_ids(child, buffer)
+                        _collect(child, buf)
                 else:
-                    buffer.append(int(node))
+                    buf.append(int(node))
 
             for group in target_ids:
                 if not isinstance(group, SequenceABC) or len(group) == 0:
                     raise ValueError(
                         "Each target_id group must be a non-empty sequence."
                     )
-                flat_tokens: list[int] = []
-                _collect_token_ids(group, flat_tokens)
-                seen = set()
-                deduped: list[int] = []
-                for tid_int in flat_tokens:
-                    if tid_int not in seen:
-                        seen.add(tid_int)
-                        deduped.append(tid_int)
+                flat: list[int] = []
+                _collect(group, flat)
+                seen_g: set = set()
+                deduped = [t for t in flat if t not in seen_g and not seen_g.add(t)]
                 if not deduped:
                     raise ValueError(
                         "Each target_id group must contain at least one unique token id."
@@ -386,57 +419,52 @@ class TFBStatCalculator(StatCalculator):
         self._target_token_indices = [
             torch.tensor(group, dtype=torch.long) for group in normalized
         ]
-        if not self._target_token_indices:
-            raise ValueError("target_ids must contain at least one token id.")
         self._class_primary_tokens = [group[0] for group in normalized]
 
+    # ------------------------------------------------------------------
+    # Classification helpers
+    # ------------------------------------------------------------------
     def _get_last_token_indices(self, attention_mask: torch.Tensor) -> torch.Tensor:
-        seq_len = attention_mask.size(1)
-        return (seq_len - 1 - attention_mask.flip(dims=[1]).argmax(dim=1)).long()
+        return (
+            attention_mask.size(1) - 1 - attention_mask.flip(dims=[1]).argmax(dim=1)
+        ).long()
 
     def _compute_class_probs(
         self, logits: torch.Tensor, attention_mask: torch.Tensor
     ) -> torch.Tensor:
+        """Extract and normalise class probabilities from the last-token logits."""
         if not self._target_token_indices:
             raise ValueError("target_ids must be configured for classification mode.")
         last_indices = self._get_last_token_indices(attention_mask)
         batch_idx = torch.arange(logits.size(0), device=logits.device)
         last_logits = logits[batch_idx, last_indices]
         token_log_probs = torch.log_softmax(last_logits, dim=-1)
+
         class_probs = []
         for idx_tensor in self._target_token_indices:
             idx = idx_tensor.to(token_log_probs.device)
             class_probs.append(
                 torch.index_select(token_log_probs, dim=-1, index=idx).exp().sum(dim=-1)
             )
-        class_probs_tensor = torch.stack(class_probs, dim=-1)
-        class_probs_tensor = class_probs_tensor / torch.clamp(
-            class_probs_tensor.sum(dim=-1, keepdim=True), min=1e-12
-        )
-        return class_probs_tensor
+        probs = torch.stack(class_probs, dim=-1)
+        return probs / torch.clamp(probs.sum(dim=-1, keepdim=True), min=1e-12)
 
-    def _build_metadata(self) -> dict:
-        return {
-            "beta": self.beta,
-            "calibration": self._calibration_summary,
-            "n_samples": self.n_samples,
-            "max_seq_len": self.max_seq_len,
-            "mode": "classification" if self.target_ids is not None else "generation",
-        }
-
-    def _tokenize_classification_text(
-        self, model: WhiteboxModel, text: str
-    ) -> dict[str, torch.Tensor]:
+    def _tokenize_batch(self, model: WhiteboxModel, texts: List[str]) -> dict:
+        """Tokenise a batch of texts with optional truncation."""
         if self.max_seq_len is None:
-            return model.tokenize([text])
+            return model.tokenize(texts)
 
         if model.instruct:
-            chat = [{"role": "user", "content": text}]
-            formatted = model.tokenizer.apply_chat_template(
-                chat, add_generation_prompt=True, tokenize=False
-            )
+            formatted = [
+                model.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": t}],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                for t in texts
+            ]
             return model.tokenizer(
-                [formatted],
+                formatted,
                 padding=True,
                 return_tensors="pt",
                 add_special_tokens=False,
@@ -445,7 +473,7 @@ class TFBStatCalculator(StatCalculator):
             )
 
         return model.tokenizer(
-            [text],
+            texts,
             padding=True,
             return_tensors="pt",
             add_special_tokens=True,
@@ -453,33 +481,74 @@ class TFBStatCalculator(StatCalculator):
             max_length=self.max_seq_len,
         )
 
-    def _binary_search(self, model: WhiteboxModel) -> float:
-        """Performs the TFB calibration."""
-        if not self.anchor_inputs:
-            raise ValueError("No beta and no anchor dataset provided.")
+    # ------------------------------------------------------------------
+    # Beta calibration (binary search)
+    # ------------------------------------------------------------------
+    def _metric_seq_nll(self, model, inputs, targets) -> float:
+        nlls = []
+        hf_model = model.model
+        tokenizer = model.tokenizer
+        for inp, trg in zip(inputs, targets):
+            try:
+                full_text = inp + trg
+                enc = tokenizer(full_text, return_tensors="pt").to(model.device())
+                labels = enc.input_ids.clone()
+                inp_len = tokenizer(inp, return_tensors="pt").input_ids.shape[1]
+                labels[:, :inp_len] = -100
+                with torch.no_grad():
+                    outputs = hf_model(**enc, labels=labels)
+                    nlls.append(outputs.loss.item())
+            except Exception as e:
+                log.warning(f"TFB calibration error (seq_nll): {e}")
+                return 100.0
+        return float(np.mean(nlls))
 
-        log.info(f"TFB: Starting calibration (Target degradation < {self.epsilon})...")
+    def _chunked_generate_texts(self, model, texts, max_new_tokens):
+        results = []
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i : i + self.batch_size]
+            results.extend(model.generate_texts(batch, max_new_tokens=max_new_tokens))
+        return results
+
+    def _metric_exact_match(self, model, inputs, targets) -> float:
+        try:
+            generated = self._chunked_generate_texts(model, inputs, max_new_tokens=10)
+            mismatches = sum(
+                1 for g, t in zip(generated, targets) if g.strip() != t.strip()
+            )
+            return mismatches / max(len(targets), 1)
+        except Exception as e:
+            log.warning(f"TFB calibration error (exact_match): {e}")
+            return 1.0
+
+    def _binary_search(self, model: WhiteboxModel) -> float:
+        """Find the largest beta whose calibration degradation stays below epsilon."""
+        if not self.anchor_inputs:
+            raise ValueError(
+                "Beta calibration requires anchor_inputs.  Either provide a "
+                "fixed beta or supply an anchor dataset."
+            )
+        log.info(f"TFB: starting calibration (target degradation < {self.epsilon})")
+
+        metric_fn = {
+            "seq_nll": self._metric_seq_nll,
+            "exact_match": self._metric_exact_match,
+        }[self.calibration_mode]
 
         hf_model = model.model
-        metric_fn = self._get_calibration_metric_fn()
-
-        # 1. Baseline (Deterministic)
         set_tfb_mode(hf_model, False)
 
-        # Determine targets for calibration
         if self.anchor_targets:
             calibration_targets = self.anchor_targets
         else:
-            log.info("TFB: Generating baseline targets for calibration...")
+            log.info("TFB: generating baseline targets for calibration …")
             calibration_targets = self._chunked_generate_texts(
                 model, self.anchor_inputs, max_new_tokens=20
             )
 
         baseline_val = metric_fn(model, self.anchor_inputs, calibration_targets)
+        log.info(f"TFB: baseline {self.calibration_mode} = {baseline_val:.4f}")
 
-        log.info(f"TFB: Baseline Metric ({self.calibration_mode}) = {baseline_val:.4f}")
-
-        # 2. Search
         low, high = self.beta_min, self.beta_max
         best_beta = low
         history = []
@@ -488,26 +557,20 @@ class TFBStatCalculator(StatCalculator):
             mid = (low + high) / 2
             set_tfb_mode(hf_model, True)
             update_tfb_beta(hf_model, mid)
-
             curr_val = metric_fn(model, self.anchor_inputs, calibration_targets)
             degradation = curr_val - baseline_val
             history.append(
-                {
-                    "beta": mid,
-                    "metric": curr_val,
-                    "degradation": degradation,
-                }
+                {"beta": mid, "metric": curr_val, "degradation": degradation}
             )
-
             log.info(
-                f"TFB: Iter {i + 1}, Beta={mid:.4f}, Metric={curr_val:.4f}, Delta={degradation:.4f}"
+                f"TFB: iter {i + 1}, beta={mid:.4f}, "
+                f"metric={curr_val:.4f}, delta={degradation:.4f}"
             )
-
             if degradation < self.epsilon:
                 best_beta = mid
-                low = mid  # Try more noise
+                low = mid
             else:
-                high = mid  # Too much noise
+                high = mid
 
         self._calibration_summary = {
             "mode": self.calibration_mode,
@@ -517,181 +580,110 @@ class TFBStatCalculator(StatCalculator):
             "best_beta": best_beta,
             "anchor_size": len(calibration_targets),
         }
-
         return best_beta
 
+    # ------------------------------------------------------------------
+    # Metadata
+    # ------------------------------------------------------------------
+    def _build_metadata(self) -> dict:
+        return {
+            "beta": self.beta,
+            "calibration": self._calibration_summary,
+            "n_samples": self.n_samples,
+            "max_seq_len": self.max_seq_len,
+            "mode": "classification",
+        }
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
     def __call__(
         self,
-        dependencies: dict[str, np.array],
-        texts: list[str],
+        dependencies: dict,
+        texts: List[str],
         model: WhiteboxModel,
         max_new_tokens: int = 100,
-    ) -> dict[str, np.ndarray]:
+        **kwargs,
+    ) -> dict:
         patch_model_for_tfb(model.model, use_softplus=self.use_softplus)
 
-        if self.beta is None and self.target_ids is None:
+        # Resolve target_labels → target_ids on first call (needs tokenizer)
+        if self._target_token_indices is None and self.target_labels:
+            self._resolve_target_labels(model.tokenizer)
+
+        if self._target_token_indices is None:
             raise NotImplementedError(
-                "Generation-mode beta search is temporarily disabled. "
-                "Provide a fixed beta for generation mode."
+                "TFB is currently supported only in classification mode.  "
+                "Set target_ids or target_labels to define class tokens.  "
+                "Free-form generation uncertainty via TFB has undefined "
+                "semantics and may be supported in a future release."
             )
 
+        # Calibrate beta if needed
         if self.beta is None:
             if not self._is_calibrated:
                 self.beta = self._binary_search(model)
                 self._is_calibrated = True
-            current_beta = self.beta
-        else:
-            current_beta = self.beta
 
-        # Result containers
-        all_res_texts = []
-        all_res_log_probs = []
-        all_res_tokens = []
-        all_res_target_probs = []
+        # Result accumulators
+        all_texts: list = []
+        all_log_probs: list = []
+        all_tokens: list = []
+        all_target_probs: list = []
 
         try:
-            update_tfb_beta(model.model, current_beta)
+            update_tfb_beta(model.model, self.beta)
             set_tfb_mode(model.model, True)
 
-            bs = self.batch_size if self.batch_size > 0 else 1
+            for i in range(0, len(texts), self.batch_size):
+                chunk_texts = texts[i : i + self.batch_size]
+                batch_enc = self._tokenize_batch(model, chunk_texts)
+                batch_enc = {k: v.to(model.device()) for k, v in batch_enc.items()}
+                chunk_size = len(chunk_texts)
 
-            # Classification mode: use forward pass at last input position
-            if self.target_ids is not None:
-                if not self._target_token_indices:
-                    self._configure_target_ids(self.target_ids)
+                # [n_samples][chunk_size, n_classes]
+                sample_probs_list: list[torch.Tensor] = []
 
-                for i in range(0, len(texts), bs):
-                    chunk_texts = texts[i : i + bs]
-
-                    for text in chunk_texts:
-                        batch_tokens = self._tokenize_classification_text(model, text)
-                        batch_tokens = {
-                            k: v.to(model.device()) for k, v in batch_tokens.items()
-                        }
-
-                        sample_texts = []
-                        sample_log_probs = []
-                        sample_target_probs = []
-
-                        with torch.no_grad():
-                            for _ in range(self.n_samples):
-                                logits = model.model(**batch_tokens).logits
-                                class_probs = self._compute_class_probs(
-                                    logits, batch_tokens["attention_mask"]
-                                ).squeeze(0)
-                                probs_tensor = class_probs.detach()
-                                log_probs_tensor = torch.log(
-                                    torch.clamp(probs_tensor, min=1e-12)
-                                )
-
-                                sample_target_probs.append(probs_tensor.cpu().tolist())
-                                sample_log_probs.append(log_probs_tensor.cpu().tolist())
-
-                                pred_idx = int(probs_tensor.argmax().item())
-                                pred_token_id = self._class_primary_tokens[pred_idx]
-                                pred_text = model.tokenizer.decode([pred_token_id])
-                                sample_texts.append(pred_text)
-
-                        all_res_texts.append(sample_texts)
-                        all_res_log_probs.append(sample_log_probs)
-                        all_res_tokens.append([[] for _ in range(self.n_samples)])
-                        all_res_target_probs.append(sample_target_probs)
-
-                        del batch_tokens
-                        torch.cuda.empty_cache()
-
-            # Generation mode: use model.generate()
-            else:
-                for i in range(0, len(texts), bs):
-                    chunk_texts = texts[i : i + bs]
-
-                    # Expand
-                    expanded_texts = []
-                    for t in chunk_texts:
-                        expanded_texts.extend([t] * self.n_samples)
-
-                    batch_tokens = model.tokenize(expanded_texts)
-                    batch_tokens = {
-                        k: v.to(model.device()) for k, v in batch_tokens.items()
-                    }
-
-                    with torch.no_grad():
-                        out = model.generate(
-                            **batch_tokens,
-                            output_scores=True,
-                            return_dict_in_generate=True,
-                            max_new_tokens=max_new_tokens,
-                            min_new_tokens=2,
-                            num_return_sequences=1,
+                with torch.no_grad():
+                    for _ in range(self.n_samples):
+                        logits = model.model(**batch_enc).logits
+                        class_probs = self._compute_class_probs(
+                            logits, batch_enc["attention_mask"]
                         )
+                        sample_probs_list.append(class_probs.detach().cpu())
 
-                    sequences = out.sequences
-                    scores = torch.stack(out.scores, dim=1) if out.scores else None
+                # Reshape into per-item results
+                for k in range(chunk_size):
+                    item_probs = []  # [n_samples, n_classes]
+                    item_log_probs = []  # [n_samples, n_classes]
+                    item_texts = []  # [n_samples]
 
-                    if model.model_type == "CausalLM":
-                        input_len = batch_tokens["input_ids"].shape[1]
-                        gen_sequences = sequences[:, input_len:]
-                    elif model.model_type == "Seq2SeqLM":
-                        gen_sequences = sequences[:, 1:]
-                    else:
-                        input_len = batch_tokens["input_ids"].shape[1]
-                        gen_sequences = sequences[:, input_len:]
+                    for s in range(self.n_samples):
+                        probs_k = sample_probs_list[s][k]
+                        item_probs.append(probs_k.tolist())
+                        item_log_probs.append(
+                            torch.log(torch.clamp(probs_k, min=1e-12)).tolist()
+                        )
+                        pred_idx = int(probs_k.argmax().item())
+                        pred_token_id = self._class_primary_tokens[pred_idx]
+                        item_texts.append(model.tokenizer.decode([pred_token_id]))
 
-                    cpu_seqs = gen_sequences.cpu().tolist()
-                    cpu_scores = scores.cpu() if scores is not None else None
+                    all_target_probs.append(item_probs)
+                    all_log_probs.append(item_log_probs)
+                    all_texts.append(item_texts)
+                    all_tokens.append([[] for _ in range(self.n_samples)])
 
-                    # Process chunk results
-                    for k in range(len(chunk_texts)):
-                        start = k * self.n_samples
-                        end = start + self.n_samples
-
-                        sample_texts = []
-                        sample_log_probs = []
-                        sample_tokens = []
-
-                        for j in range(start, end):
-                            seq = cpu_seqs[j]
-                            if model.tokenizer.eos_token_id in seq:
-                                eos_idx = seq.index(model.tokenizer.eos_token_id)
-                                seq = seq[:eos_idx]
-                            text = model.tokenizer.decode(seq)
-
-                            if cpu_scores is not None:
-                                slen = min(len(seq), cpu_scores.shape[1])
-                                current_scores = cpu_scores[j, :slen, :]
-                                current_log_probs = torch.log_softmax(
-                                    current_scores, dim=-1
-                                )
-
-                                token_ids = torch.tensor(seq[:slen]).unsqueeze(-1)
-                                token_log_probs = torch.gather(
-                                    current_log_probs, -1, token_ids
-                                ).squeeze(-1)
-                                sample_log_probs.append(token_log_probs.tolist())
-                            else:
-                                sample_log_probs.append([])
-
-                            sample_texts.append(text)
-                            sample_tokens.append(seq)
-
-                        all_res_texts.append(sample_texts)
-                        all_res_log_probs.append(sample_log_probs)
-                        all_res_tokens.append(sample_tokens)
-
-                    # Clean up chunk memory
-                    del out
-                    del scores
-                    del cpu_scores
-                    del batch_tokens
+                del batch_enc
+                if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
         finally:
             set_tfb_mode(model.model, False)
 
         return {
-            f"{self.stats_key}_texts": all_res_texts,
-            f"{self.stats_key}_log_probs": all_res_log_probs,
-            f"{self.stats_key}_tokens": all_res_tokens,
-            f"{self.stats_key}_target_probs": all_res_target_probs,
+            f"{self.stats_key}_texts": all_texts,
+            f"{self.stats_key}_log_probs": all_log_probs,
+            f"{self.stats_key}_tokens": all_tokens,
+            f"{self.stats_key}_target_probs": all_target_probs,
             f"{self.stats_key}_metadata": self._build_metadata(),
         }

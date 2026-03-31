@@ -1,0 +1,24 @@
+# TFB stat-calculator config for MMLU (4 choices: A/B/C/D)
+
+- name: TFBStatCalculator
+  builder: lm_polygraph.defaults.stat_calculator_builders.default_TFBStatCalculator
+  cfg:
+    stats_key: tfb_mmlu
+
+    # Anchor set from train split (populated dynamically)
+    anchor_inputs: null
+
+    # Labels resolved at runtime via the model tokenizer.
+    target_labels: ["A", "B", "C", "D"]
+
+    n_samples: 10
+    batch_size: 4
+    max_seq_len: null
+
+    beta: 0.001
+    use_softplus: false
+
+    target_epsilon: 0.003
+    beta_range: [0.001, 0.2]
+    beta_search_steps: 10
+    calibration_mode: seq_nll

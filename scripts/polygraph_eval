@@ -225,12 +225,50 @@ def get_stat_calculator_names(config):
     for stat_calculator in config.stat_calculators:
         if stat_calculator == "auto":
             continue
+
+        cfg = getattr(stat_calculator, "cfg", OmegaConf.create({}))
+        if cfg is None:
+            cfg = OmegaConf.create({})
+        stats = getattr(stat_calculator, "stats", None)
+        dependencies = getattr(stat_calculator, "dependencies", None)
+
+        if stats is None:
+            stats = []
+        elif OmegaConf.is_config(stats):
+            stats = OmegaConf.to_container(stats, resolve=True)
+
+        if dependencies is None:
+            dependencies = []
+        elif OmegaConf.is_config(dependencies):
+            dependencies = OmegaConf.to_container(dependencies, resolve=True)
+
+        # When stats are not explicitly listed in the YAML config but a builder
+        # is specified, eagerly build the calculator to discover its stats and
+        # dependencies from the instance.  This is the generic mechanism that
+        # replaces the former TFB-specific name check.
+        if not stats and getattr(stat_calculator, "builder", None):
+            try:
+                from lm_polygraph.utils.factory_stat_calculator import (
+                    create_stat_calculator,
+                )
+                tmp_calc = create_stat_calculator(
+                    stat_calculator.builder, cfg, BuilderEnvironmentStatCalculator(model=None),
+                )
+                stats = list(tmp_calc.stats)
+                if not dependencies:
+                    dependencies = list(tmp_calc.stat_dependencies)
+            except Exception as e:
+                log.warning(
+                    f"Could not eagerly build stat calculator "
+                    f"{stat_calculator.name} to discover stats: {e}"
+                )
+
         sc = StatCalculatorContainer(
             name=stat_calculator.name,
-            cfg=stat_calculator.cfg,
-            stats=stat_calculator.stats,
-            dependencies=stat_calculator.dependencies,
-            builder=stat_calculator.builder,
+            cfg=cfg,
+            stats=stats,
+            dependencies=dependencies,
+            builder=getattr(stat_calculator, "builder", None),
         )
         all_stat_calculators.append(sc)
 

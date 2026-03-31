@@ -1,0 +1,7 @@
+# TFB estimator config for polygraph_eval.
+# Use with matching stats_key from TFBStatCalculator.
+# TFBSequenceEstimator: Semantic entropy over TFB stochastic forward passes.
+
+- name: TFBSequenceEstimator
+  cfg:
+    stats_key: tfb

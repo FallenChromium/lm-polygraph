@@ -60,6 +60,8 @@ def load_simple_estimators(name: str, config):
         CSL,
         SemanticDensity,
         BoostedProbSequence,
+        TFBSequenceEstimator,
+        TFBTokenEstimator,
     ]
 
     try:
