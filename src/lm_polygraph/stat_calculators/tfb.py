@@ -87,20 +87,26 @@ def patch_model_for_tfb(
             lora_B = module.lora_B[adapter_name]
 
             # SVD of B: B = U @ diag(D) @ Vh
-            U, D, Vh = torch.linalg.svd(lora_B.weight.float(), full_matrices=False)
+            # Perform SVD on CPU (small matrices, avoids CUDA compat issues)
+            orig_device = lora_B.weight.device
+            B_cpu = lora_B.weight.detach().float().cpu()
+            A_cpu = lora_A.weight.detach().float().cpu()
+            U, D, Vh = torch.linalg.svd(B_cpu, full_matrices=False)
             in_features = module.in_features
 
             target_sigma = _compute_target_sigma(initial_beta, D, in_features)
             rho = _sigma_to_rho(target_sigma, use_softplus).to(lora_A.weight.dtype)
 
-            module.tfb_rho[adapter_name] = nn.Parameter(rho)
-            module.tfb_singular_values[adapter_name] = D
+            module.tfb_rho[adapter_name] = nn.Parameter(rho.to(orig_device))
+            module.tfb_singular_values[adapter_name] = D.to(orig_device)
 
             # Rotate weights into SVD basis (one-time transformation)
-            lora_B.weight = nn.Parameter((U @ torch.diag(D)).to(lora_B.weight.dtype))
-            lora_A.weight = nn.Parameter(
-                (Vh @ lora_A.weight.float()).to(lora_A.weight.dtype)
+            new_B = (U @ torch.diag(D)).to(
+                dtype=lora_B.weight.dtype, device=orig_device
             )
+            new_A = (Vh @ A_cpu).to(dtype=lora_A.weight.dtype, device=orig_device)
+            lora_B.weight = nn.Parameter(new_B)
+            lora_A.weight = nn.Parameter(new_A)
 
         module.forward = _create_tfb_forward(module.forward, module)
         module._tfb_patched = True
